@@ -17,6 +17,8 @@
 </head>
 <body>
   <div id="authScreen" class="auth-screen" hidden></div>
+  <!-- toast lives OUTSIDE #app so messages also show on the sign-in screen -->
+  <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
   <div id="installBanner" class="install-banner" hidden>
     <span>Install Hisably on your home screen</span>
     <button type="button" id="installBtn" class="btn btn-primary btn-sm">Install</button>
@@ -80,7 +82,6 @@
       </button>
     </nav>
 
-    <div id="toast" class="toast" hidden></div>
     <div id="modalRoot"></div>
     <div id="scannerRoot"></div>
   </div>
