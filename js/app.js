@@ -3237,24 +3237,33 @@
     enterApp();
   }
 
-  // PWA install prompt
+  // PWA install prompt (hidden once installed; "✕" is remembered for 7 days)
   let deferredInstall = null;
+  const INSTALL_DISMISS_KEY = 'hisably_install_dismissed';
+  function hideInstallBanner(remember) {
+    const ban = document.getElementById('installBanner');
+    if (ban) { ban.hidden = true; ban.style.display = 'none'; }
+    if (remember) { try { localStorage.setItem(INSTALL_DISMISS_KEY, String(Date.now())); } catch (e) {} }
+  }
+  function installDismissedRecently() {
+    try { return Date.now() - Number(localStorage.getItem(INSTALL_DISMISS_KEY) || 0) < 7 * 864e5; } catch (e) { return false; }
+  }
+  const isStandalone = (window.matchMedia && window.matchMedia('(display-mode: standalone)').matches) || window.navigator.standalone === true;
+  if (isStandalone) hideInstallBanner(false);
   window.addEventListener('beforeinstallprompt', (e) => {
     e.preventDefault();
     deferredInstall = e;
+    if (isStandalone || installDismissedRecently()) return;
     const ban = document.getElementById('installBanner');
-    if (ban) ban.hidden = false;
+    if (ban) { ban.style.display = ''; ban.hidden = false; }
   });
+  window.addEventListener('appinstalled', () => { deferredInstall = null; hideInstallBanner(false); });
   document.getElementById('installBtn')?.addEventListener('click', async () => {
-    if (!deferredInstall) return;
+    if (!deferredInstall) { hideInstallBanner(false); return; }
     deferredInstall.prompt();
-    await deferredInstall.userChoice;
+    try { await deferredInstall.userChoice; } catch (e) {}
     deferredInstall = null;
-    const ban = document.getElementById('installBanner');
-    if (ban) ban.hidden = true;
+    hideInstallBanner(false);
   });
-  document.getElementById('installDismiss')?.addEventListener('click', () => {
-    const ban = document.getElementById('installBanner');
-    if (ban) ban.hidden = true;
-  });
+  document.getElementById('installDismiss')?.addEventListener('click', () => hideInstallBanner(true));
 })();
