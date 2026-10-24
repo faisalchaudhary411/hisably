@@ -486,7 +486,7 @@ body {
   background: var(--text); color: white;
   padding: 12px 20px; border-radius: 12px;
   font-size: 0.875rem; font-weight: 500;
-  z-index: 300; opacity: 0;
+  z-index: 9999; opacity: 0;
   transition: opacity 0.25s, transform 0.25s;
   max-width: calc(100% - 32px); text-align: center;
   pointer-events: none;
@@ -728,3 +728,9 @@ body {
 
 /* The hidden attribute must always win over component display rules */
 [hidden] { display: none !important; }
+
+.auth-msg { margin: 0 0 14px; padding: 10px 12px; border-radius: 10px; font-size: 0.8125rem; line-height: 1.4; display: none; }
+.auth-msg.show { display: block; }
+.auth-msg.error { background: #FEE2E2; color: #991B1B; border: 1px solid #FCA5A5; }
+.auth-msg.ok { background: #D1FAE5; color: #065F46; border: 1px solid #6EE7B7; }
+.auth-msg.info { background: #E0F2FE; color: #075985; border: 1px solid #7DD3FC; }
