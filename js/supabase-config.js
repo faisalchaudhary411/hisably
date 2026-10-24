@@ -6,8 +6,8 @@
  * Paste values from: Supabase Dashboard → Project Settings → API
  */
 window.HISABLY_SUPABASE = {
-  url: 'https://YOUR_PROJECT_REF.supabase.co',
-  anonKey: 'YOUR_ANON_PUBLIC_KEY',
+  url: 'https://ompsksmckxuudshukxbg.supabase.co',
+  anonKey: 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im9tcHNrc21ja3h1dWRzaHVreGJnIiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTI4NTU0OTAsImV4cCI6MjEwODQzMTQ5MH0.Zxm-t3zCLylpmGfWOYEw035UYrX01AlNrPB1EDZpqOw',
   // Leave enabled false until keys are set
-  enabled: false
+  enabled: true
 };
