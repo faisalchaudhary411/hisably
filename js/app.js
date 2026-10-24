@@ -2969,6 +2969,8 @@
         <button type="button" class="auth-tab ${isLogin ? 'active' : ''}" data-auth-tab="login">Sign in</button>
         <button type="button" class="auth-tab ${!isLogin ? 'active' : ''}" data-auth-tab="register">Sign up</button>
       </div>
+      ${(window.HisablyCloud && HisablyCloud.ready()) ? '' : `<div class="auth-msg show error">This app is not connected to its server yet (Supabase keys missing or disabled in <b>js/supabase-config.js</b>), so signing in or signing up cannot work. The app owner must finish the setup.</div>`}
+      <div id="authMsg" class="auth-msg" role="alert"></div>
       <form id="authForm">
         ${!isLogin ? `<div class="form-group"><label class="form-label">Full name</label><input class="form-input" name="fullName" placeholder="Your name" /></div>
         <div class="form-group"><label class="form-label">Shop name</label><input class="form-input" name="shopName" placeholder="Business name" /></div>
@@ -2994,6 +2996,13 @@
     bindAuthForm();
   }
 
+  // Show messages on the sign-in card itself (always visible) AND as a toast
+  function authSay(msg, kind) {
+    toast(msg, 5000);
+    const el = document.getElementById('authMsg');
+    if (el) { el.textContent = msg; el.className = 'auth-msg show ' + (kind || 'info'); }
+  }
+
   function bindAuthForm() {
     const form = document.getElementById('authForm');
     if (!form) return;
@@ -3012,14 +3021,14 @@
         const cloudReady = window.HisablyCloud && HisablyCloud.ready();
         // Local signup is disabled — accounts must be created via cloud (Supabase)
         if (isRegister && !cloudReady) {
-          toast('Signup requires cloud setup. Contact the app owner.');
+          authSay('Sign up is not available yet: the app is not connected to its server. Contact the app owner.', 'error');
           return;
         }
         if (isRegister && (!fullName || !shopName)) {
-          toast('Please enter your name and shop name');
+          authSay('Please enter your name and shop name', 'error');
           return;
         }
-        toast(isRegister ? 'Creating account…' : 'Signing in…');
+        authSay(isRegister ? 'Creating account…' : 'Signing in…', 'info');
         let profShopName = shopName;
         if (cloudReady) {
           if (isRegister) {
@@ -3028,7 +3037,7 @@
               const auth = document.getElementById('authScreen');
               auth.innerHTML = renderAuthHTML('login');
               bindAuthForm();
-              toast('Account created! Open the confirmation email, then sign in.', 7000);
+              authSay('Account created! Open the confirmation email we sent, then sign in.', 'ok');
               return;
             }
           } else {
@@ -3062,7 +3071,7 @@
       } catch (err) {
         console.error(err);
         const m = String((err && err.message) || 'Auth failed');
-        toast(/invalid login/i.test(m) ? 'Wrong email or password' : /confirm/i.test(m) ? 'Please confirm your email first, then sign in' : m, 4000);
+        authSay(/invalid login/i.test(m) ? 'Wrong email or password' : /confirm/i.test(m) ? 'Please confirm your email first, then sign in' : /failed to fetch|network/i.test(m) ? 'No internet connection or server unreachable. Check your connection and try again.' : m, 'error');
       } finally {
         if (btn) btn.disabled = false;
       }
