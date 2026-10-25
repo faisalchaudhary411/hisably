@@ -97,6 +97,9 @@
     }
     session = data.session;
     await loadProfile();
+    if (!profile || !profile.shop_id) {
+      throw new Error('Your account was created but your shop was not set up. The database setup is incomplete (run all 5 setup files), then sign in again.');
+    }
     return { needsConfirm: false, user: data.user };
   }
 
@@ -365,7 +368,36 @@
     })
   };
 
+  // Talks to the 'shopify' Supabase Edge Function (see SHOPIFY-SETUP.md)
+  async function shopifyCall(action, payload) {
+    const sb = need();
+    const { data } = await sb.auth.getSession();
+    const tok = data.session && data.session.access_token;
+    if (!tok) throw new Error('Sign in first');
+    let res;
+    try {
+      res = await fetch(`${cfg.url}/functions/v1/shopify`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', apikey: cfg.anonKey, Authorization: 'Bearer ' + tok },
+        body: JSON.stringify(Object.assign({ action }, payload || {}))
+      });
+    } catch (e) {
+      throw new Error('Could not reach the server. Check your internet.');
+    }
+    let j = {};
+    try { j = await res.json(); } catch (e) {}
+    if (!res.ok) {
+      const err = new Error(res.status === 404
+        ? 'The Shopify function is not deployed in your Supabase project yet. Follow SHOPIFY-SETUP.md.'
+        : (j.error || ('Shopify request failed (' + res.status + ')')));
+      err.status = res.status;
+      throw err;
+    }
+    return j;
+  }
+
   window.HisablyCloud = {
+    shopifyCall,
     ready,
     init,
     signUp,

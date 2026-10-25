@@ -17,6 +17,8 @@
       suppliers: 10,
       paymentQrOnInvoice: false,
       cloudSync: true,
+      bulkTools: false,
+      shopify: false,
       label: 'Free'
     },
     trial: {
@@ -27,16 +29,20 @@
       suppliers: 9999,
       paymentQrOnInvoice: true,
       cloudSync: true,
+      bulkTools: true,
+      shopify: true,
       label: 'Trial'
     },
     basic: {
-      products: 9999,
-      invoices: 9999,
-      customers: 9999,
-      expenses: 9999,
-      suppliers: 9999,
+      products: 300,
+      invoices: 1500,
+      customers: 200,
+      expenses: 1000,
+      suppliers: 50,
       paymentQrOnInvoice: true,
       cloudSync: true,
+      bulkTools: false,
+      shopify: false,
       label: 'Basic'
     },
     pro: {
@@ -47,6 +53,8 @@
       suppliers: 9999,
       paymentQrOnInvoice: true,
       cloudSync: true,
+      bulkTools: true,
+      shopify: true,
       label: 'Pro'
     },
     blocked: {
@@ -57,6 +65,8 @@
       suppliers: 0,
       paymentQrOnInvoice: false,
       cloudSync: false,
+      bulkTools: false,
+      shopify: false,
       label: 'Inactive'
     }
   };
@@ -71,6 +81,7 @@
     note: 'Send payment and tap “I paid” with your shop name.',
     basicPrice: 499,
     proPrice: 999,
+    lifetimePrice: 14999,
     currency: 'PKR',
     freemiumEnabled: true
   };
@@ -140,6 +151,7 @@
     }
     if (status === 'active') {
       // Paid plans are monthly: once paid_until passes the shop falls back to Free
+      if (cache.planId === 'lifetime') return { key: 'pro', limits: LIMITS.pro, cache };
       if (cache.paidUntil && new Date(cache.paidUntil).getTime() <= now) {
         return { key: 'free', limits: LIMITS.free, cache: Object.assign({}, cache, { status: 'expired_paid' }) };
       }
@@ -151,6 +163,11 @@
     return { key: 'free', limits: LIMITS.free, cache };
   }
 
+  function hasFeature(name) {
+    const { limits, key } = effectivePlan();
+    return key !== 'blocked' && !!limits[name];
+  }
+
   function canAdd(type, currentCount) {
     const { limits, key } = effectivePlan();
     if (key === 'blocked') return { ok: false, reason: 'Your account is inactive. Upgrade or contact support.' };
@@ -159,7 +176,9 @@
     if (currentCount >= max) {
       return {
         ok: false,
-        reason: `Free plan limit reached: max ${max} ${type}. Upgrade to Basic/Pro for unlimited.`
+        reason: key === 'basic'
+          ? `Basic plan limit reached: max ${max} ${type}. Upgrade to Pro for unlimited.`
+          : `Free plan limit reached: max ${max} ${type}. Upgrade to Basic/Pro.`
       };
     }
     return { ok: true, remaining: max - currentCount };
@@ -274,6 +293,7 @@
     nowMs,
     effectivePlan,
     canAdd,
+    hasFeature,
     localRegister,
     localSignIn,
     localSetUserPlan,
