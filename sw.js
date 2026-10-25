@@ -1,10 +1,11 @@
 /* Hisably service worker – offline app shell + cached libraries */
-const CACHE = 'hisably-v7';
+const CACHE = 'hisably-v10';
 
 const LOCAL_ASSETS = [
   './',
   './index.html',
   './css/styles.css',
+  './js/receipt.js',
   './js/app.js',
   './js/freemium.js',
   './js/cloud.js',
