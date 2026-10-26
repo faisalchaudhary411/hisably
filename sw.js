@@ -1,5 +1,5 @@
 /* Hisably service worker – offline app shell + cached libraries */
-const CACHE = 'hisably-v10';
+const CACHE = 'hisably-v11';
 
 const LOCAL_ASSETS = [
   './',
