@@ -734,3 +734,8 @@ body {
 .auth-msg.error { background: #FEE2E2; color: #991B1B; border: 1px solid #FCA5A5; }
 .auth-msg.ok { background: #D1FAE5; color: #065F46; border: 1px solid #6EE7B7; }
 .auth-msg.info { background: #E0F2FE; color: #075985; border: 1px solid #7DD3FC; }
+
+.help-box { background: var(--surface-2, #F1F5F9); border: 1px solid var(--border); border-radius: 12px; padding: 10px 14px; margin-bottom: 14px; }
+.help-box summary { cursor: pointer; font-weight: 600; font-size: 0.875rem; color: var(--primary); }
+.help-box ol { margin: 4px 0 10px 18px; padding: 0; line-height: 1.55; }
+.help-box p { margin: 8px 0 2px; }
