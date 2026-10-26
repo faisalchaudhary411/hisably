@@ -37,7 +37,7 @@
 
   function need() {
     const sb = getClient();
-    if (!sb) throw new Error('Cloud not configured');
+    if (!sb) throw new Error('Online features are not available right now. Please try again later.');
     return sb;
   }
 
@@ -98,7 +98,7 @@
     session = data.session;
     await loadProfile();
     if (!profile || !profile.shop_id) {
-      throw new Error('Your account was created but your shop was not set up. The database setup is incomplete (run all 5 setup files), then sign in again.');
+      throw new Error('Your account was created but your shop could not be set up yet. Please contact support.');
     }
     return { needsConfirm: false, user: data.user };
   }
@@ -388,7 +388,7 @@
     try { j = await res.json(); } catch (e) {}
     if (!res.ok) {
       const err = new Error(res.status === 404
-        ? 'The Shopify function is not deployed in your Supabase project yet. Follow SHOPIFY-SETUP.md.'
+        ? 'The Shopify connection is not available yet. Please contact support.'
         : (j.error || ('Shopify request failed (' + res.status + ')')));
       err.status = res.status;
       throw err;

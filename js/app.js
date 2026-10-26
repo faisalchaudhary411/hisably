@@ -324,7 +324,18 @@
       </div>`;
   }
   let _toastTimer = null;
+  // Never show developer-style errors to shop owners
+  function friendlyMsg(m) {
+    const t = String(m == null ? '' : m);
+    if (/failed to fetch|networkerror|load failed|network request|fetch failed/i.test(t)) return 'No internet connection. Check your connection and try again.';
+    if (/row-level security|permission denied|\brls\b/i.test(t)) return 'You are not allowed to do that. Please sign in again.';
+    if (/\bjwt\b/i.test(t)) return 'Your session expired. Please sign in again.';
+    if (/pgrst|does not exist|syntax error|violates|duplicate key|supabase|\bsql\b|edge function|deploy|\.md\b|\.js\b|typeerror|referenceerror|is not a function|undefined|cannot read|\bhttp \d{3}\b|\bdb (get|post|patch)/i.test(t)) return 'Something went wrong. Please try again. If it keeps happening, contact support.';
+    return t;
+  }
+
   function toast(msg, ms = 2500) {
+    msg = friendlyMsg(msg);
     const el = $('#toast');
     if (!el) return;
     clearTimeout(_toastTimer);
@@ -1888,7 +1899,8 @@
     } catch (e) {
       if (e && e.name === 'NotFoundError') { rcStatus('No printer selected.'); return; }   // user closed the picker
       console.error(e);
-      rcStatus('Printer error: ' + String((e && e.message) || e).slice(0, 140));
+      const raw = String((e && e.message) || e);
+      rcStatus(/bluetooth|chrome|android/i.test(raw) && /needs|support/i.test(raw) ? raw : 'Could not talk to the printer. Make sure it is switched on, close to your phone and not connected to another app, then try again.');
     }
   }
 
@@ -2903,7 +2915,7 @@
   async function doCloudSync(opts = {}) {
     const silent = !!opts.silent;
     if (!window.HisablyCloud || !HisablyCloud.ready()) {
-      if (!silent) toast('Cloud not configured');
+      if (!silent) toast('Online features are not available right now. Please try again later.');
       return false;
     }
     if (!HisablyCloud.getSession()) {
@@ -3104,7 +3116,7 @@
         <button type="button" class="auth-tab ${isLogin ? 'active' : ''}" data-auth-tab="login">Sign in</button>
         <button type="button" class="auth-tab ${!isLogin ? 'active' : ''}" data-auth-tab="register">Sign up</button>
       </div>
-      ${(window.HisablyCloud && HisablyCloud.ready()) ? '' : `<div class="auth-msg show error">This app is not connected to its server yet (Supabase keys missing or disabled in <b>js/supabase-config.js</b>), so signing in or signing up cannot work. The app owner must finish the setup.</div>`}
+      ${(window.HisablyCloud && HisablyCloud.ready()) ? '' : `<div class="auth-msg show error">Sign in and sign up are temporarily unavailable. Please try again later or contact support.</div>`}
       <div id="authMsg" class="auth-msg" role="alert"></div>
       <form id="authForm">
         ${!isLogin ? `<div class="form-group"><label class="form-label">Full name</label><input class="form-input" name="fullName" placeholder="Your name" /></div>
@@ -3156,7 +3168,7 @@
         const cloudReady = window.HisablyCloud && HisablyCloud.ready();
         // Local signup is disabled — accounts must be created via cloud (Supabase)
         if (isRegister && !cloudReady) {
-          authSay('Sign up is not available yet: the app is not connected to its server. Contact the app owner.', 'error');
+          authSay('Sign up is temporarily unavailable. Please try again later or contact support.', 'error');
           return;
         }
         if (isRegister && (!fullName || !shopName)) {
@@ -3206,7 +3218,7 @@
       } catch (err) {
         console.error(err);
         const m = String((err && err.message) || 'Auth failed');
-        authSay(/invalid login/i.test(m) ? 'Wrong email or password' : /confirm/i.test(m) ? 'Please confirm your email first, then sign in' : /failed to fetch|network/i.test(m) ? 'No internet connection or server unreachable. Check your connection and try again.' : m, 'error');
+        authSay(/invalid login/i.test(m) ? 'Wrong email or password' : /confirm/i.test(m) ? 'Please confirm your email first, then sign in' : /failed to fetch|network/i.test(m) ? 'No internet connection or server unreachable. Check your connection and try again.' : friendlyMsg(m), 'error');
       } finally {
         if (btn) btn.disabled = false;
       }
@@ -3258,7 +3270,7 @@
     } catch (e) {
       console.error('plan refresh', e);
       // Don't silently show "Free": tell the user their plan could not be loaded
-      if (navigator.onLine) toast('Could not load your plan: ' + String((e && e.message) || e).slice(0, 120), 6000);
+      if (navigator.onLine) toast('Could not load your plan. Check your internet connection, then reopen the app.', 6000);
     }
   }
 
@@ -3335,7 +3347,7 @@
           <div class="font-semibold">${escapeHtml(st.domain)}</div>
           <div class="text-sm" style="color:var(--success);margin-top:4px">● Connected</div>
           <div class="text-sm text-secondary mt-8">Last sync: ${escapeHtml(when(st.last_push_at || st.last_pull_at))}</div>
-          ${st.last_error ? `<div class="text-sm mt-8" style="color:var(--danger)">Last problem: ${escapeHtml(st.last_error)}</div>` : ''}
+          ${st.last_error ? `<div class="text-sm mt-8" style="color:var(--danger)">The last sync had a problem. Tap “Sync now” to retry. If it keeps happening, check that your Shopify app still has the permissions listed below, or contact support.</div>` : ''}
         </div>
         ${(st.locations || []).length > 1 ? `<div class="form-group"><label class="form-label">Stock location (stock is synced for this one)</label>
           <select class="form-input" id="shopifyLoc">${st.locations.map(l => `<option value="${escapeHtml(l.id)}" ${l.id === st.location_id ? 'selected' : ''}>${escapeHtml(l.name)}</option>`).join('')}</select></div>`
@@ -3359,7 +3371,27 @@
       return;
     }
     $('#modalRoot').innerHTML = `<div class="modal-overlay"><div class="modal-sheet"><div class="modal-handle"></div>${head}
-      <p class="text-sm text-secondary mb-12">Connect your Shopify store: products, prices, stock, customers and online orders flow into Hisably, and your price / stock changes flow back. Step-by-step help is in <strong>SHOPIFY-SETUP.md</strong>.</p>
+      <p class="text-sm text-secondary mb-12">Connect your Shopify store: products, prices, stock, customers and online orders flow into Hisably, and your price / stock changes flow back.</p>
+      <details class="help-box"><summary>How do I get these details?</summary>
+        <div class="text-sm">
+          <p><strong>Your store address</strong> is the one that ends with <em>.myshopify.com</em> (Shopify admin → Settings → Domains).</p>
+          <p><strong>Option 1 – new Shopify apps (Dev Dashboard)</strong></p>
+          <ol>
+            <li>Go to <strong>dev.shopify.com</strong> and sign in with the store owner account.</li>
+            <li>Create an app named <em>Hisably</em>.</li>
+            <li>Give it these permissions: read &amp; write <em>products</em> and <em>inventory</em>; read <em>orders</em>, <em>customers</em> and <em>locations</em>.</li>
+            <li>Release it and <strong>install it on your store</strong>.</li>
+            <li>Open the app’s Settings, copy the <strong>Client ID</strong> and <strong>Client secret</strong> and paste them below.</li>
+          </ol>
+          <p><strong>Option 2 – older custom app</strong></p>
+          <ol>
+            <li>Shopify admin → Settings → Apps and sales channels → <strong>Develop apps</strong> → create an app.</li>
+            <li>Give it the same permissions as above and install it.</li>
+            <li>Copy the <strong>Admin API access token</strong> (starts with <em>shpat_</em>, shown only once) and the <strong>API secret key</strong>, and paste them below.</li>
+          </ol>
+          <p>Tip: try it first with one test product. Your existing Hisably products are matched by barcode/SKU or name, so nothing is duplicated.</p>
+        </div>
+      </details>
       <form id="shopifyForm" autocomplete="off">
         <div class="form-group"><label class="form-label">Store address</label>
           <input class="form-input" name="domain" placeholder="mystore.myshopify.com" autocapitalize="none" required /></div>
