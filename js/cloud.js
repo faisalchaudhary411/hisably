@@ -17,7 +17,12 @@
   let session = null;
   let profile = null;
 
-  const TABLES = ['products', 'customers', 'suppliers', 'invoices', 'expenses', 'stock_movements'];
+  const TABLES = ['products', 'customers', 'suppliers', 'invoices', 'expenses', 'stock_movements', 'purchases'];
+  // Tables added later: if the SQL part has not been run yet, skip them instead of breaking sync
+  const OPTIONAL = { purchases: true };
+  function missingTable(err) {
+    return !!err && (err.code === '42P01' || err.code === 'PGRST205' || /does not exist|schema cache|Could not find the table/i.test(err.message || ''));
+  }
   const PAGE = 1000;
   const CHUNK = 200;
 
@@ -176,6 +181,7 @@
         .eq('shop_id', sid)
         .order('id')
         .range(from, from + PAGE - 1);
+      if (error && OPTIONAL[table] && missingTable(error)) return [];
       if (error) throw error;           // IMPORTANT: a failed read must never look like "no data"
       out.push(...(data || []));
       if (!data || data.length < PAGE) break;
@@ -211,6 +217,7 @@
     const sb = need();
     for (let i = 0; i < rows.length; i += CHUNK) {
       const { error } = await sb.from(table).upsert(rows.slice(i, i + CHUNK), { onConflict: 'id' });
+      if (error && OPTIONAL[table] && missingTable(error)) return;
       if (error) throw error;
     }
   }
@@ -227,6 +234,7 @@
         .update({ deleted_at: now, updated_at: now })
         .in('id', slice)
         .eq('shop_id', sid);
+      if (error && OPTIONAL[table] && missingTable(error)) return;
       if (error) throw error;
     }
   }
@@ -238,7 +246,7 @@
   async function push(changes) {
     const sid = shopId();
     if (!need() || !sid) throw new Error('No shop linked');
-    const order = ['customers', 'products', 'suppliers', 'invoices', 'expenses', 'stock_movements'];
+    const order = ['customers', 'products', 'suppliers', 'invoices', 'expenses', 'stock_movements', 'purchases'];
     for (const t of order) {
       const key = t === 'stock_movements' ? 'stockMovements' : t;
       const list = changes[key] || [];
@@ -261,7 +269,7 @@
     const sid = shopId();
     for (const t of TABLES) {
       const { error } = await sb.from(t).delete().eq('shop_id', sid);
-      if (error) throw error;
+      if (error && !(OPTIONAL[t] && missingTable(error))) throw error;
     }
   }
 
@@ -321,7 +329,15 @@
       customerName: r.customer_name || '', customerPhone: r.customer_phone || '',
       items: Array.isArray(r.items) ? r.items : [],
       total: num(r.total), paidAmount: num(r.paid_amount),
-      paymentStatus: r.payment_status || 'unpaid', date: r.invoice_date, updatedAt: r.updated_at
+      paymentStatus: r.payment_status || 'unpaid', date: r.invoice_date, updatedAt: r.updated_at,
+      docType: r.doc_type || 'sale', meta: (r.meta && typeof r.meta === 'object') ? r.meta : {}
+    }),
+    purchases: r => ({
+      id: r.id, number: r.number, supplierId: r.supplier_id || null,
+      supplierName: r.supplier_name || '', supplierPhone: r.supplier_phone || '',
+      items: Array.isArray(r.items) ? r.items : [], total: num(r.total), paidAmount: num(r.paid_amount),
+      paymentStatus: r.payment_status || 'unpaid', date: r.purchase_date, updatedAt: r.updated_at,
+      meta: (r.meta && typeof r.meta === 'object') ? r.meta : {}
     }),
     expenses: r => ({
       id: r.id, title: r.title, amount: num(r.amount), category: r.category || 'Other',
@@ -353,7 +369,15 @@
       customer_name: inv.customerName || null, customer_phone: inv.customerPhone || null,
       items: inv.items || [], total: num(inv.total), paid_amount: num(inv.paidAmount),
       payment_status: inv.paymentStatus || 'unpaid', invoice_date: iso(inv.date),
+      doc_type: inv.docType || 'sale', meta: inv.meta || {},
       updated_at: iso(inv.updatedAt), deleted_at: null
+    }),
+    purchases: (p, sid) => ({
+      id: p.id, shop_id: sid, number: String(p.number), supplier_id: p.supplierId || null,
+      supplier_name: p.supplierName || null, supplier_phone: p.supplierPhone || null,
+      items: p.items || [], total: num(p.total), paid_amount: num(p.paidAmount),
+      payment_status: p.paymentStatus || 'unpaid', purchase_date: iso(p.date),
+      meta: p.meta || {}, updated_at: iso(p.updatedAt), deleted_at: null
     }),
     expenses: (e, sid) => ({
       id: e.id, shop_id: sid, title: e.title || 'Expense', amount: num(e.amount),

@@ -41,8 +41,31 @@
     const paid = Number(inv.paidAmount) || 0;
     const total = Number(inv.total) || 0;
     const due = Math.max(0, total - paid);
-    return { paid, total, due, label: due <= 0 ? 'PAID' : (paid > 0 ? 'PARTIAL' : 'UNPAID') };
+    return { paid, total, due, est: inv.docType === 'estimate', label: inv.docType === 'estimate' ? 'QUOTATION' : (due <= 0 ? 'PAID' : (paid > 0 ? 'PARTIAL' : 'UNPAID')) };
   }
+  // Subtotal + discount/tax/charges/round-off rows from invoice meta (empty for plain invoices)
+  function extras(inv) {
+    const m = inv.meta || {}, rows = [];
+    if (!(m.discount || m.tax || m.charges || m.roundOff)) return { sub: 0, rows };
+    const sub = (inv.items || []).reduce((s, i) => s + (Number(i.price) || 0) * (Number(i.qty) || 0), 0);
+    if (m.discount) rows.push(['Discount' + (m.discType === 'pct' && m.discValue ? ' (' + m.discValue + '%)' : ''), -m.discount]);
+    if (m.tax) rows.push([(m.taxName || 'Tax') + ' (' + m.taxRate + '%)', m.tax]);
+    if (m.charges) rows.push([m.chargeLabel || 'Charges', m.charges]);
+    if (m.roundOff) rows.push(['Round off', m.roundOff]);
+    return { sub, rows };
+  }
+  function docWord(inv) { return inv.docType === 'return' ? 'Credit Note' : (inv.docType === 'estimate' ? 'Quotation' : 'Invoice'); }
+  // ----- Invoice themes (PDF, shared image, A4 print). Thermal receipts stay black & white. -----
+  const THEMES = {
+    teal:    { name: 'Teal',    accent: '#0D9488', dark: '#0F766E', soft: '#CCFBF1', softer: '#F0FDFA', style: 'band', pro: false },
+    classic: { name: 'Classic', accent: '#111827', dark: '#111827', soft: '#E5E7EB', softer: '#F9FAFB', style: 'line', pro: false },
+    royal:   { name: 'Royal',   accent: '#2563EB', dark: '#1D4ED8', soft: '#DBEAFE', softer: '#EFF6FF', style: 'band', pro: true },
+    maroon:  { name: 'Maroon',  accent: '#9F1239', dark: '#881337', soft: '#FFE4E6', softer: '#FFF1F2', style: 'band', pro: true },
+    gold:    { name: 'Elegant', accent: '#B45309', dark: '#92400E', soft: '#FEF3C7', softer: '#FFFBEB', style: 'line', pro: true },
+    forest:  { name: 'Forest',  accent: '#166534', dark: '#14532D', soft: '#DCFCE7', softer: '#F0FDF4', style: 'line', pro: true }
+  };
+  function themeOf(s) { return THEMES[(s && s.invoiceTheme) || 'teal'] || THEMES.teal; }
+  function hexRgb(h) { const n = parseInt(String(h).replace('#', ''), 16); return [(n >> 16) & 255, (n >> 8) & 255, n & 255]; }
   function lineAmount(it) { return (Number(it.price) || 0) * (Number(it.qty) || 0); }
 
   // =====================================================================
@@ -92,7 +115,7 @@ img.qr{width:${small ? 30 : 36}mm;height:${small ? 30 : 36}mm;image-rendering:pi
 </div>
 <div class="hr"></div>
 <div class="meta">
-  <div><span>Invoice</span><b>${esc(inv.number)}</b></div>
+  <div><span>${docWord(inv)}</span><b>${esc(inv.number)}</b></div>
   <div><span>Date</span><span>${esc(ctx.formatDate(inv.date))}</span></div>
   <div><span>Customer</span><span>${esc(inv.customerName || 'Walk-in')}</span></div>
   ${inv.customerPhone ? `<div><span>Phone</span><span>${esc(inv.customerPhone)}</span></div>` : ''}
@@ -100,9 +123,10 @@ img.qr{width:${small ? 30 : 36}mm;height:${small ? 30 : 36}mm;image-rendering:pi
 <div class="hr"></div>
 ${rows}
 <div class="hr"></div>
+${(() => { const x = extras(inv); return x.rows.length ? `<div class="row"><span>Subtotal</span><span>${cur} ${esc(ctx.money(x.sub))}</span></div>` + x.rows.map(q => `<div class="row"><span>${esc(q[0])}</span><span>${q[1] < 0 ? '-' : ''}${cur} ${esc(ctx.money(Math.abs(q[1])))}</span></div>`).join('') : ''; })()}
 <div class="row tot"><span>TOTAL</span><span>${cur} ${esc(ctx.money(st.total))}</span></div>
-<div class="row"><span>Paid</span><span>${cur} ${esc(ctx.money(st.paid))}</span></div>
-${st.due > 0 ? `<div class="row"><b>Balance due</b><b>${cur} ${esc(ctx.money(st.due))}</b></div>` : ''}
+${st.est ? '' : `<div class="row"><span>Paid</span><span>${cur} ${esc(ctx.money(st.paid))}</span></div>`}
+${!st.est && st.due > 0 ? `<div class="row"><b>Balance due</b><b>${cur} ${esc(ctx.money(st.due))}</b></div>` : ''}
 <div class="c"><span class="badge">${st.label}</span></div>
 ${(ctx.qrAllowed && s.paymentQr) ? `<div class="c" style="margin-top:6px"><img class="qr" src="${esc(s.paymentQr)}" alt=""><div class="sub">Scan to pay</div><div class="sub">${esc(s.paymentNote || '')}</div></div>` : ''}
 <div class="c foot">${esc(footer || 'Thank you for your business!')}</div>
@@ -112,28 +136,29 @@ ${(ctx.qrAllowed && s.paymentQr) ? `<div class="c" style="margin-top:6px"><img c
   function a4HTML(inv, ctx) {
     const s = ctx.settings, cur = esc(s.currency || '');
     const st = statusOf(inv);
+    const TH = themeOf(s);
     const color = st.label === 'PAID' ? '#059669' : (st.label === 'PARTIAL' ? '#d97706' : '#dc2626');
     const rows = (inv.items || []).map((it, i) => `
       <tr><td class="n">${i + 1}</td><td>${esc(it.name)}</td><td class="r">${esc(it.qty)}</td>
       <td class="r">${esc(ctx.money(it.price))}</td><td class="r"><b>${esc(ctx.money(lineAmount(it)))}</b></td></tr>`).join('');
-    return `<!DOCTYPE html><html><head><meta charset="utf-8"><title>Invoice ${esc(inv.number)}</title>
+    return `<!DOCTYPE html><html><head><meta charset="utf-8"><title>${docWord(inv)} ${esc(inv.number)}</title>
 <style>
 @page{size:A4;margin:12mm}
 *{box-sizing:border-box}
 body{margin:0;font:13px/1.45 ${FONT};color:#0f172a;-webkit-print-color-adjust:exact;print-color-adjust:exact}
-.top{display:flex;justify-content:space-between;align-items:flex-start;border-bottom:3px solid #0d9488;padding-bottom:14px}
+.top{display:flex;justify-content:space-between;align-items:flex-start;border-bottom:3px solid ${TH.accent};padding-bottom:14px}
 .brand{display:flex;gap:14px;align-items:center}
 .brand img{width:64px;height:64px;object-fit:contain}
 .brand h1{margin:0;font-size:24px}
 .brand .sub{color:#475569;font-size:12px}
 .inv{text-align:right}
-.inv .t{font-size:26px;font-weight:800;color:#0d9488;letter-spacing:.04em}
+.inv .t{font-size:26px;font-weight:800;color:${TH.accent};letter-spacing:.04em}
 .inv .no{font-size:15px;font-weight:700}
 .cols{display:flex;justify-content:space-between;margin:18px 0}
 .lbl{font-size:10px;letter-spacing:.08em;color:#94a3b8;font-weight:700;text-transform:uppercase}
 .badge{display:inline-block;color:#fff;background:${color};padding:3px 12px;border-radius:6px;font-weight:700;font-size:12px}
 table{width:100%;border-collapse:collapse;margin-top:6px}
-th{background:#f1f5f9;text-align:left;font-size:11px;color:#475569;padding:8px 10px;letter-spacing:.05em}
+th{background:${TH.softer};text-align:left;font-size:11px;color:#475569;padding:8px 10px;letter-spacing:.05em}
 td{padding:8px 10px;border-bottom:1px solid #e2e8f0;vertical-align:top}
 tr:nth-child(even) td{background:#fafcfd}
 .r{text-align:right}.n{width:34px;color:#94a3b8}
@@ -143,7 +168,7 @@ thead{display:table-header-group}tr{break-inside:avoid}
 .qr img{width:96px;height:96px;object-fit:contain}
 .sum{min-width:260px}
 .sum .row{display:flex;justify-content:space-between;padding:4px 0}
-.sum .grand{background:#ccfbf1;color:#0f766e;font-size:17px;font-weight:800;padding:9px 12px;border-radius:8px;margin-top:6px}
+.sum .grand{background:${TH.soft};color:${TH.dark};font-size:17px;font-weight:800;padding:9px 12px;border-radius:8px;margin-top:6px}
 .sign{display:flex;justify-content:space-between;margin-top:46px;color:#64748b;font-size:11px}
 .sign div{border-top:1px solid #94a3b8;padding-top:4px;width:180px;text-align:center}
 .foot{text-align:center;margin-top:22px;color:#64748b;font-size:12px}
@@ -155,7 +180,7 @@ thead{display:table-header-group}tr{break-inside:avoid}
     <div class="sub">${esc([s.address, s.city].filter(Boolean).join(', '))}</div>
     <div class="sub">${esc([s.phone, s.email].filter(Boolean).join('  ·  '))}</div>
     ${s.taxId ? `<div class="sub">NTN / Tax: ${esc(s.taxId)}</div>` : ''}</div></div>
-  <div class="inv"><div class="t">INVOICE</div><div class="no">${esc(inv.number)}</div><div class="sub">${esc(ctx.formatDate(inv.date))}</div></div>
+  <div class="inv"><div class="t">${docWord(inv).toUpperCase()}</div><div class="no">${esc(inv.number)}</div><div class="sub">${esc(ctx.formatDate(inv.date))}</div></div>
 </div>
 <div class="cols">
   <div><div class="lbl">Bill to</div><div style="font-size:16px;font-weight:700">${esc(inv.customerName || 'Walk-in Customer')}</div>
@@ -166,9 +191,9 @@ thead{display:table-header-group}tr{break-inside:avoid}
 <div class="bottom">
   <div>${(ctx.qrAllowed && s.paymentQr) ? `<div class="qr"><img src="${esc(s.paymentQr)}" alt=""><div><b>Scan to pay</b><div style="color:#64748b;font-size:12px">${esc(s.paymentNote || '')}</div></div></div>` : ''}</div>
   <div class="sum">
-    <div class="row"><span>Subtotal</span><span>${cur} ${esc(ctx.money(st.total))}</span></div>
-    <div class="row"><span>Paid</span><span style="color:#059669">${cur} ${esc(ctx.money(st.paid))}</span></div>
-    ${st.due > 0 ? `<div class="row"><span>Balance due</span><b style="color:#dc2626">${cur} ${esc(ctx.money(st.due))}</b></div>` : ''}
+    ${(() => { const x = extras(inv); return `<div class="row"><span>Subtotal</span><span>${cur} ${esc(ctx.money(x.rows.length ? x.sub : st.total))}</span></div>` + x.rows.map(q => `<div class="row"><span>${esc(q[0])}</span><span>${q[1] < 0 ? '-' : ''}${cur} ${esc(ctx.money(Math.abs(q[1])))}</span></div>`).join(''); })()}
+    ${st.est ? '' : `<div class="row"><span>Paid</span><span style="color:#059669">${cur} ${esc(ctx.money(st.paid))}</span></div>`}
+    ${!st.est && st.due > 0 ? `<div class="row"><span>Balance due</span><b style="color:#dc2626">${cur} ${esc(ctx.money(st.due))}</b></div>` : ''}
     <div class="row grand"><span>Total</span><span>${cur} ${esc(ctx.money(st.total))}</span></div>
   </div>
 </div>
@@ -317,7 +342,7 @@ thead{display:table-header-group}tr{break-inside:avoid}
       if (s.phone) center(s.phone, 17, false);
       if (s.taxId) center('NTN/Tax: ' + s.taxId, 16, false);
       dash();
-      lr('Invoice', String(inv.number), 18, true);
+      lr(docWord(inv), String(inv.number), 18, true);
       lr('Date', String(c.formatDate(inv.date)), 18, false);
       lr('Customer', String(inv.customerName || 'Walk-in'), 18, false);
       if (inv.customerPhone) lr('Phone', String(inv.customerPhone), 18, false);
@@ -332,9 +357,14 @@ thead{display:table-header-group}tr{break-inside:avoid}
         y += Math.round(3 * S);
       });
       dash();
+      const ex = extras(inv);
+      if (ex.rows.length) {
+        lr('Subtotal', `${cur} ${c.money(ex.sub)}`, 19, false);
+        ex.rows.forEach(q => lr(q[0], `${q[1] < 0 ? '-' : ''}${cur} ${c.money(Math.abs(q[1]))}`, 19, false));
+      }
       lr('TOTAL', `${cur} ${c.money(st.total)}`, 25, true);
-      lr('Paid', `${cur} ${c.money(st.paid)}`, 19, false);
-      if (st.due > 0) lr('Balance due', `${cur} ${c.money(st.due)}`, 21, true);
+      if (!st.est) lr('Paid', `${cur} ${c.money(st.paid)}`, 19, false);
+      if (!st.est && st.due > 0) lr('Balance due', `${cur} ${c.money(st.due)}`, 21, true);
       y += Math.round(6 * S);
       center('[ ' + st.label + ' ]', 22, true);
       if (qr) {
@@ -560,6 +590,7 @@ thead{display:table-header-group}tr{break-inside:avoid}
   window.HisablyReceipt = {
     PAPER, getPrefs, setPrefs, receiptHTML, printHTML, renderCanvas, testCanvas, toBitmap,
     bluetoothPrint, btSupported, forgetDevice,
+    THEMES, themeOf, hexRgb,
     _t: { crc8, catPacket, reverseBits }
   };
 })();

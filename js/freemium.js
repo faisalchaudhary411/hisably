@@ -19,6 +19,8 @@
       cloudSync: true,
       bulkTools: false,
       shopify: false,
+      passcode: false,
+      themes: false,
       label: 'Free'
     },
     trial: {
@@ -31,6 +33,8 @@
       cloudSync: true,
       bulkTools: true,
       shopify: true,
+      passcode: true,
+      themes: true,
       label: 'Trial'
     },
     basic: {
@@ -43,6 +47,8 @@
       cloudSync: true,
       bulkTools: false,
       shopify: false,
+      passcode: false,
+      themes: false,
       label: 'Basic'
     },
     pro: {
@@ -55,6 +61,8 @@
       cloudSync: true,
       bulkTools: true,
       shopify: true,
+      passcode: true,
+      themes: true,
       label: 'Pro'
     },
     blocked: {
@@ -67,6 +75,8 @@
       cloudSync: false,
       bulkTools: false,
       shopify: false,
+      passcode: false,
+      themes: false,
       label: 'Inactive'
     }
   };

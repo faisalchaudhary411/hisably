@@ -12,13 +12,14 @@
     suppliers: 'sb_suppliers_v2',
     expenses: 'sb_expenses_v2',
     stockMovements: 'sb_stock_v2',
+    purchases: 'sb_purchases_v2',
     settings: 'sb_settings_v2',
     counter: 'sb_counter_v2',
     tombs: 'sb_tombstones_v3'      // ids deleted locally, waiting to be deleted in the cloud
   };
   const OWNER_KEY = 'hisably_data_owner_v1';        // which account the local data belongs to
   const LEGACY_FLAG = 'sb_legacy_reset_pending';    // v1 -> v2 id migration needs a clean cloud
-  const SYNC_COLLECTIONS = ['products', 'customers', 'suppliers', 'invoices', 'expenses', 'stockMovements'];
+  const SYNC_COLLECTIONS = ['products', 'customers', 'suppliers', 'invoices', 'expenses', 'stockMovements', 'purchases'];
   const DB_TABLE = { stockMovements: 'stock_movements' };
   const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -48,6 +49,7 @@
   let suppliers = load(STORAGE.suppliers, []);
   let expenses = load(STORAGE.expenses, []);
   let stockMovements = load(STORAGE.stockMovements, []);
+  let purchases = load(STORAGE.purchases, []);
   function defaultSettings() {
     return {
       businessName: 'My Business',
@@ -59,6 +61,11 @@
       taxId: '',
       currency: 'PKR',
       invoicePrefix: 'INV',
+      taxRate: 0,
+      invoiceTheme: 'teal',
+      pinSalt: '',
+      pinHash: '',
+      staffHash: '',
       lowStockDefault: 5,
       logo: '',
       paymentQr: '',
@@ -67,6 +74,7 @@
   }
   let settings = Object.assign(defaultSettings(), load(STORAGE.settings, {}));
   let invoiceCounter = load(STORAGE.counter, 1001);
+  let docCtx = {};                 // {type:'return', ref:invoice} set before opening the create form
   let tombs = load(STORAGE.tombs, {});
 
   let currentView = 'dashboard';
@@ -118,16 +126,47 @@
     return true;
   }
 
+  // Document kinds: 'sale' (default), 'return' (credit note, reverses a sale), 'estimate' (no effect on books)
+  function docSign(inv) { return inv.docType === 'return' ? -1 : (inv.docType === 'estimate' ? 0 : 1); }
+  function docWord(inv) { return inv.docType === 'return' ? 'Credit Note' : (inv.docType === 'estimate' ? 'Quotation' : 'Invoice'); }
+  function nextDocNumber(prefix) {
+    let mx = 1000;
+    invoices.forEach(i => {
+      const m = String(i.number).match(/^(.*?)-?(\d+)\s*$/);
+      if (m && m[1] === prefix) mx = Math.max(mx, parseInt(m[2], 10));
+    });
+    return `${prefix}-${mx + 1}`;
+  }
+  function returnedQty(refId) {
+    const r = {};
+    invoices.forEach(i => {
+      if (i.docType === 'return' && i.meta && i.meta.refId === refId) (i.items || []).forEach(it => { r[it.productId] = (r[it.productId] || 0) + (it.qty || 0); });
+    });
+    return r;
+  }
+  // Net sales / cost / receivable across all documents (returns subtract, estimates ignored)
+  function netTotals() {
+    let revenue = 0, cogs = 0, recv = 0;
+    invoices.forEach(i => {
+      const g = docSign(i); if (!g) return;
+      revenue += g * (i.total || 0);
+      cogs += g * (i.items || []).reduce((a, it) => a + ((it.cost || 0) * it.qty), 0);
+      recv += g * Math.max(0, (i.total || 0) - (i.paidAmount || 0));
+    });
+    return { revenue: round2(revenue), cogs: round2(cogs), receivable: Math.max(0, round2(recv)) };
+  }
+
   function customerBalance(customerId, customerName, customerPhone) {
-    let due = 0, paid = 0, total = 0, count = 0;
+    let net = 0, paid = 0, total = 0, count = 0;
     invoices.forEach(inv => {
       if (!invoiceBelongsToCustomer(inv, customerId, customerName, customerPhone)) return;
-      total += inv.total || 0;
-      paid += inv.paidAmount || 0;
-      due += Math.max(0, (inv.total || 0) - (inv.paidAmount || 0));
+      const g = docSign(inv); if (!g) return;
+      total += g * (inv.total || 0);
+      paid += g * (inv.paidAmount || 0);
+      net += g * Math.max(0, (inv.total || 0) - (inv.paidAmount || 0));
       count++;
     });
-    return { due, paid, total, count };
+    return { due: Math.max(0, round2(net)), credit: Math.max(0, round2(-net)), paid, total, count };
   }
 
   function findOrCreateCustomer(name, phone) {
@@ -160,7 +199,7 @@
 
   // One-time migration: link invoices to customers by name, migrate old storage keys
   function getList(n) {
-    return { products, customers, suppliers, invoices, expenses, stockMovements }[n];
+    return { products, customers, suppliers, invoices, expenses, stockMovements, purchases }[n];
   }
   function setList(n, list) {
     if (n === 'products') products = list;
@@ -169,6 +208,7 @@
     else if (n === 'invoices') invoices = list;
     else if (n === 'expenses') expenses = list;
     else if (n === 'stockMovements') stockMovements = list;
+    else if (n === 'purchases') purchases = list;
   }
   function ts(x) { const t = Date.parse(x); return isNaN(t) ? 0 : t; }
 
@@ -198,8 +238,17 @@
       i.total = Number(i.total) || 0;
       i.paidAmount = Number(i.paidAmount) || 0;
       i.number = String(i.number == null ? '' : i.number);
+      i.docType = i.docType || 'sale';
+      if (!i.meta || typeof i.meta !== 'object') i.meta = {};
       i.date = i.date || nowIso;
       i.updatedAt = i.updatedAt || i.date;
+    });
+    purchases.forEach(p => {
+      if (!Array.isArray(p.items)) p.items = [];
+      p.total = Number(p.total) || 0; p.paidAmount = Number(p.paidAmount) || 0;
+      p.number = String(p.number == null ? '' : p.number); p.date = p.date || nowIso;
+      p.updatedAt = p.updatedAt || p.date;
+      if (!p.meta || typeof p.meta !== 'object') p.meta = {};
     });
     stockMovements.forEach(m => { m.qty = Number(m.qty) || 0; m.date = m.date || nowIso; m.updatedAt = m.updatedAt || m.date; });
     // Never reuse an invoice number that already exists (other device / restored backup)
@@ -358,6 +407,7 @@
     save(STORAGE.suppliers, suppliers);
     save(STORAGE.expenses, expenses);
     save(STORAGE.stockMovements, stockMovements);
+    save(STORAGE.purchases, purchases);
     save(STORAGE.settings, settings);
     save(STORAGE.counter, invoiceCounter);
     save(STORAGE.tombs, tombs);
@@ -382,10 +432,14 @@
 
   // ---------- Navigation ----------
   function setView(view, options = {}) {
+    if (isStaff()) {
+      if (!STAFF_VIEWS.includes(view)) { toast('Only the owner can open that'); view = 'dashboard'; }
+      if (view === 'create-invoice' && docCtx.type === 'purchase') docCtx = {};
+    }
     if (!options.keepHistory) previousView = currentView;
     currentView = view;
     $$('.nav-item').forEach(b => b.classList.toggle('active', b.dataset.view === view));
-    const showBack = ['customers','suppliers','reports','expenses','stock-history'].includes(view);
+    const showBack = ['customers','suppliers','reports','expenses','stock-history','purchases','daybook'].includes(view);
     $('#backBtn').hidden = !showBack;
     render();
     window.scrollTo(0, 0);
@@ -402,11 +456,17 @@
       dashboard: () => { title.textContent = 'Dashboard'; content.innerHTML = viewDashboard(); },
       products: () => {
         title.textContent = 'Products';
-        right.innerHTML = `<button class="btn btn-secondary btn-sm" data-action="bulk-tools" style="margin-right:8px">Bulk</button><button class="icon-btn" data-action="add-product" aria-label="Add"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg></button>`;
+        if (!isStaff()) right.innerHTML = `<button class="btn btn-secondary btn-sm" data-action="bulk-tools" style="margin-right:8px">Bulk</button><button class="icon-btn" data-action="add-product" aria-label="Add"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg></button>`;
         content.innerHTML = viewProducts();
       },
       invoices: () => { title.textContent = 'Invoices'; content.innerHTML = viewInvoices(); },
-      'create-invoice': () => { title.textContent = 'New Invoice'; content.innerHTML = viewCreateInvoice(); bindCreateInvoice(); },
+      daybook: () => { title.textContent = 'Day Book'; content.innerHTML = viewDayBook(); },
+      purchases: () => {
+        title.textContent = 'Purchases';
+        right.innerHTML = `<button class="icon-btn" data-action="new-purchase"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg></button>`;
+        content.innerHTML = viewPurchases();
+      },
+      'create-invoice': () => { title.textContent = (docCtx.type === 'purchase' ? 'New Purchase' : docCtx.type === 'return' ? 'Sale Return' : docCtx.type === 'estimate' ? 'New Quotation' : 'New Invoice'); content.innerHTML = viewCreateInvoice(); bindCreateInvoice(); },
       more: () => { title.textContent = 'More'; content.innerHTML = viewMore(); },
       customers: () => {
         title.textContent = 'Customers';
@@ -438,13 +498,20 @@
     const totalProducts = products.length;
     const low = products.filter(p => p.stock > 0 && p.stock <= lowLimit(p)).length;
     const out = products.filter(p => p.stock <= 0).length;
-    const revenue = invoices.reduce((s, i) => s + (i.total || 0), 0);
-    const cogs = invoices.reduce((s, inv) => s + inv.items.reduce((a, it) => a + ((it.cost || 0) * it.qty), 0), 0);
+    const { revenue, cogs, receivable } = netTotals();
     const totalExpenses = expenses.reduce((s, e) => s + (e.amount || 0), 0);
     const profit = revenue - cogs - totalExpenses;
-    const receivable = invoices.reduce((s, i) => s + Math.max(0, (i.total || 0) - (i.paidAmount || 0)), 0);
     const recent = [...invoices].sort((a,b) => new Date(b.date) - new Date(a.date)).slice(0, 5);
 
+    if (isStaff()) return `<div class="fade-in">
+      <div class="stats-grid" style="grid-template-columns:repeat(3,1fr)">
+        <div class="stat-card"><div class="stat-label">Products</div><div class="stat-value primary">${totalProducts}</div></div>
+        <div class="stat-card"><div class="stat-label">Low Stock</div><div class="stat-value warning">${low}</div></div>
+        <div class="stat-card"><div class="stat-label">Out</div><div class="stat-value danger">${out}</div></div>
+      </div>
+      <div class="section-header"><h2 class="section-title">Recent Invoices</h2></div>
+      ${recent.length === 0 ? emptyState('invoice', 'No invoices yet', 'Create an invoice with the + button.', 'Create Invoice', 'create-invoice') : `<div class="list">${recent.map(inv => listInvoice(inv)).join('')}</div>`}
+    </div>`;
     return `<div class="fade-in">
       ${typeof planBannerHTML === 'function' ? planBannerHTML() : ''}
       <div class="stats-grid">
@@ -453,10 +520,13 @@
         <div class="stat-card"><div class="stat-label">Expenses</div><div class="stat-value danger">${settings.currency} ${money(totalExpenses)}</div></div>
         <div class="stat-card"><div class="stat-label">Net Profit</div><div class="stat-value ${profit >= 0 ? 'success' : 'danger'}">${settings.currency} ${money(profit)}</div></div>
       </div>
-      <div class="stats-grid" style="margin-top:-8px;margin-bottom:20px;grid-template-columns:repeat(3,1fr)">
+      <div class="stats-grid" style="margin-top:-8px;grid-template-columns:repeat(2,1fr)">
+        <div class="stat-card"><div class="stat-label">To Collect</div><div class="stat-value success" style="font-size:1.125rem">${settings.currency} ${money(receivable)}</div></div>
+        <div class="stat-card" data-view="purchases" style="cursor:pointer"><div class="stat-label">To Pay</div><div class="stat-value ${totalPayable() > 0 ? 'danger' : 'success'}" style="font-size:1.125rem">${settings.currency} ${money(totalPayable())}</div></div>
+      </div>
+      <div class="stats-grid" style="margin-top:-8px;margin-bottom:20px;grid-template-columns:repeat(2,1fr)">
         <div class="stat-card"><div class="stat-label">Low Stock</div><div class="stat-value warning">${low}</div></div>
         <div class="stat-card"><div class="stat-label">Out of Stock</div><div class="stat-value danger">${out}</div></div>
-        <div class="stat-card"><div class="stat-label">To Receive</div><div class="stat-value ${receivable > 0 ? 'danger' : 'success'}" style="font-size:1rem">${money(receivable)}</div></div>
       </div>
       <div class="section-header">
         <h2 class="section-title">Recent Invoices</h2>
@@ -498,42 +568,631 @@
   }
 
   // ---------- Invoices ----------
+  let invFilter = 'all';
   function viewInvoices() {
     if (invoices.length === 0) {
       return emptyState('invoice', 'No invoices yet', 'Create invoices for customers and track sales.', 'Create Invoice', 'create-invoice');
     }
-    const sorted = [...invoices].sort((a,b) => new Date(b.date) - new Date(a.date));
-    return `<div class="fade-in"><div class="list">${sorted.map(inv => listInvoice(inv)).join('')}</div></div>`;
+    const kinds = [['all', 'All'], ['sale', 'Sales'], ['estimate', 'Quotes'], ['return', 'Returns']];
+    const list = invoices.filter(i => invFilter === 'all' || (i.docType || 'sale') === invFilter)
+      .sort((a, b) => new Date(b.date) - new Date(a.date));
+    return `<div class="fade-in">
+      <div class="cat-chips">${kinds.map(k => `<button class="cat-chip${invFilter === k[0] ? ' active' : ''}" data-action="inv-filter" data-kind="${k[0]}">${k[1]}</button>`).join('')}
+        <button class="cat-chip" data-action="new-estimate">+ Quotation</button><button class="cat-chip" data-action="new-return">+ Sale Return</button></div>
+      ${list.length ? `<div class="list">${list.map(inv => listInvoice(inv)).join('')}</div>` : '<div class="doc-empty">Nothing here yet</div>'}
+    </div>`;
   }
 
   function listInvoice(inv) {
     const status = inv.paymentStatus || 'unpaid';
     const paid = inv.paidAmount || 0;
+    const isRet = inv.docType === 'return';
     let badge = '';
-    if (status === 'paid' || paid >= inv.total) {
+    if (inv.docType === 'estimate') {
+      badge = inv.meta && inv.meta.convertedTo ? `<span class="list-item-badge badge-ok">Invoiced · ${escapeHtml(inv.meta.convertedTo)}</span>` : '<span class="list-item-badge badge-low">Quotation</span>';
+    } else if (isRet) {
+      badge = paid >= inv.total ? '<span class="list-item-badge badge-ok">Refunded</span>'
+        : `<span class="list-item-badge badge-low">Credit · ${settings.currency} ${money(Math.max(0, inv.total - paid))}</span>`;
+    } else if (status === 'paid' || paid >= inv.total) {
       badge = '<span class="list-item-badge badge-ok">Paid</span>';
     } else if (status === 'partial' || paid > 0) {
       badge = `<span class="list-item-badge badge-low">Partial · ${settings.currency} ${money(paid)}</span>`;
     } else {
       badge = '<span class="list-item-badge badge-out">Unpaid</span>';
     }
+    if (isOverdue(inv)) badge += ' <span class="list-item-badge badge-out">Overdue</span>';
     return `<div class="list-item" data-action="view-invoice" data-id="${inv.id}">
       <div class="list-item-icon">${initials(inv.customerName || 'C')}</div>
       <div class="list-item-body">
         <div class="list-item-title">${escapeHtml(inv.customerName || 'Walk-in Customer')}</div>
-        <div class="list-item-sub">#${escapeHtml(inv.number)} · ${formatDate(inv.date)} · ${inv.items.length} item${inv.items.length !== 1 ? 's' : ''}</div>
+        <div class="list-item-sub">${isRet ? 'Return ' : (inv.docType === 'estimate' ? 'Quote ' : '#')}${escapeHtml(inv.number)} · ${formatDate(inv.date)} · ${inv.items.length} item${inv.items.length !== 1 ? 's' : ''}</div>
         ${badge}
       </div>
-      <div class="list-item-right"><div class="list-item-price">${settings.currency} ${money(inv.total)}</div></div>
+      <div class="list-item-right"><div class="list-item-price"${isRet ? ' style="color:var(--danger)"' : ''}>${isRet ? '−' : ''}${settings.currency} ${money(inv.total)}</div></div>
     </div>`;
   }
 
-  // ---------- Create Invoice ----------
+  // ---------- Customer payments, ledger / statement, reminders ----------
+  // Money received (or refunded) against one document. Keeps a dated history in meta.payments.
+  function addPayment(inv, amt, mode, note, dateIso) {
+    const left = Math.max(0, round2((inv.total || 0) - (inv.paidAmount || 0)));
+    amt = round2(Math.min(Number(amt) || 0, left));
+    if (amt <= 0) return 0;
+    inv.meta = inv.meta || {};
+    (inv.meta.payments = inv.meta.payments || []).push({ date: dateIso || new Date().toISOString(), amount: amt, mode: mode || 'Cash', note: note || '' });
+    inv.paidAmount = round2((inv.paidAmount || 0) + amt);
+    inv.paymentStatus = inv.paidAmount >= inv.total ? 'paid' : 'partial';
+    inv.updatedAt = new Date().toISOString();
+    return amt;
+  }
+  function custDocs(cust) {
+    return invoices.filter(i => docSign(i) && invoiceBelongsToCustomer(i, cust.id, cust.name, cust.phone));
+  }
+  function isOverdue(inv) {
+    if (!(inv.meta && inv.meta.dueDate) || (inv.docType !== undefined && docSign(inv) <= 0)) return false;
+    return (inv.total || 0) - (inv.paidAmount || 0) > 0.001 && inv.meta.dueDate < new Date().toISOString().slice(0, 10);
+  }
+  // Chronological ledger: debit = customer owes more, credit = customer owes less
+  function customerLedger(cust) {
+    const rows = [];
+    custDocs(cust).forEach(inv => {
+      const ret = inv.docType === 'return';
+      rows.push({ t: ts(inv.date), date: inv.date, text: (ret ? 'Credit note ' : 'Invoice ') + inv.number, debit: ret ? 0 : inv.total, credit: ret ? inv.total : 0 });
+      const pays = (inv.meta && inv.meta.payments) || [];
+      const sumP = pays.reduce((s, p) => s + p.amount, 0);
+      const first = round2((inv.paidAmount || 0) - sumP);
+      if (first > 0.001) rows.push({ t: ts(inv.date) + 1, date: inv.date, text: (ret ? 'Refund paid' : 'Payment received') + ((inv.meta && inv.meta.paymentMode) ? ' · ' + inv.meta.paymentMode : '') + ' (' + inv.number + ')', debit: ret ? first : 0, credit: ret ? 0 : first });
+      pays.forEach(p => rows.push({ t: ts(p.date) + 1, date: p.date, text: (ret ? 'Refund paid' : 'Payment received') + (p.mode ? ' · ' + p.mode : '') + (p.note ? ' · ' + p.note : '') + ' (' + inv.number + ')', debit: ret ? p.amount : 0, credit: ret ? 0 : p.amount }));
+    });
+    rows.sort((a, b) => a.t - b.t);
+    let bal = 0;
+    rows.forEach(r => { bal = round2(bal + r.debit - r.credit); r.balance = bal; });
+    return rows;
+  }
+
+  function openReceiveModal(cust) {
+    const bal = customerBalance(cust.id, cust.name, cust.phone);
+    const saleDue = custDocs(cust).filter(i => docSign(i) > 0).reduce((s, i) => s + Math.max(0, (i.total || 0) - (i.paidAmount || 0)), 0);
+    const today = new Date().toISOString().slice(0, 10);
+    $('#modalRoot').innerHTML = `
+      <div class="modal-overlay"><div class="modal-sheet">
+        <div class="modal-handle"></div>
+        <div class="modal-header"><h3 class="modal-title">Receive Payment</h3>
+          <button class="modal-close" data-action="close-modal"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button></div>
+        <div class="text-secondary text-sm mb-8">${escapeHtml(cust.name)} · Due ${settings.currency} ${money(bal.due)}</div>
+        ${saleDue <= 0 ? '<div class="doc-empty">This customer has nothing pending.</div>' : `
+        <form id="receiveForm" autocomplete="off">
+          <div class="form-group"><label class="form-label">Amount (${settings.currency})</label>
+            <input type="number" inputmode="decimal" class="form-input" id="rcvAmt" min="0" step="any" value="${saleDue}" /></div>
+          <div class="chip-row mb-8" id="rcvMode">
+            <button type="button" class="cat-chip active" data-mode="Cash">Cash</button><button type="button" class="cat-chip" data-mode="Bank">Bank</button>
+            <button type="button" class="cat-chip" data-mode="Online">Online</button><button type="button" class="cat-chip" data-mode="Cheque">Cheque</button></div>
+          <div class="form-row">
+            <div class="form-group"><label class="form-label">Date</label><input type="date" class="form-input" id="rcvDate" value="${today}" max="${today}" /></div>
+            <div class="form-group"><label class="form-label">Note</label><input type="text" class="form-input" id="rcvNote" maxlength="40" placeholder="Optional" /></div>
+          </div>
+          <div class="text-sm text-secondary">The amount settles the oldest unpaid invoices first.</div>
+          <button type="submit" class="btn btn-primary btn-block mt-16">Save Payment</button>
+        </form>`}
+      </div></div>`;
+    const f = document.getElementById('receiveForm'); if (!f) return;
+    let mode = 'Cash';
+    document.querySelectorAll('#rcvMode .cat-chip').forEach(b => b.addEventListener('click', () => {
+      mode = b.dataset.mode; document.querySelectorAll('#rcvMode .cat-chip').forEach(x => x.classList.toggle('active', x === b));
+    }));
+    f.addEventListener('submit', e => {
+      e.preventDefault();
+      let amt = round2(parseFloat(document.getElementById('rcvAmt').value) || 0);
+      if (amt <= 0) { toast('Enter an amount'); return; }
+      if (amt > saleDue + 0.001) { toast(`Only ${settings.currency} ${money(saleDue)} is due`, 3500); return; }
+      const d = document.getElementById('rcvDate').value;
+      const dateIso = (d && d !== today) ? new Date(d + 'T12:00:00').toISOString() : new Date().toISOString();
+      const note = document.getElementById('rcvNote').value.trim();
+      const open = custDocs(cust).filter(i => docSign(i) > 0 && (i.total || 0) - (i.paidAmount || 0) > 0.001)
+        .sort((a, b) => ts(a.date) - ts(b.date));
+      let n = 0;
+      for (const inv of open) { if (amt <= 0.001) break; const used = addPayment(inv, amt, mode, note, dateIso); if (used > 0) { amt = round2(amt - used); n++; } }
+      persist();
+      toast(`Payment saved · ${n} invoice${n !== 1 ? 's' : ''} updated`);
+      render();
+      openCustomerDetail(cust);
+    });
+  }
+
+  function statementText(cust) {
+    const rows = customerLedger(cust);
+    const bal = customerBalance(cust.id, cust.name, cust.phone);
+    let t = `*${settings.businessName}*\nStatement for ${cust.name}\n\n`;
+    rows.slice(-12).forEach(r => {
+      t += `${formatDate(r.date)} · ${r.text}: ${r.debit ? '+' : '-'}${settings.currency} ${money(r.debit || r.credit)}\n`;
+    });
+    t += `\n*${bal.credit > 0 ? 'Credit with us' : 'Balance due'}: ${settings.currency} ${money(bal.credit > 0 ? bal.credit : bal.due)}*`;
+    if (settings.phone) t += `\n\nContact: ${settings.phone}`;
+    return t;
+  }
+  function reminderText(cust, onlyInv) {
+    const docs = onlyInv ? [onlyInv] : custDocs(cust).filter(i => docSign(i) > 0 && (i.total || 0) - (i.paidAmount || 0) > 0.001).sort((a, b) => ts(a.date) - ts(b.date));
+    const due = round2(docs.reduce((s, i) => s + (i.total - (i.paidAmount || 0)), 0));
+    let t = `Assalam o Alaikum ${cust.name || ''},\n\nA friendly reminder from *${settings.businessName}*: you have *${settings.currency} ${money(due)}* pending.\n\n`;
+    docs.slice(0, 6).forEach(i => {
+      t += `• ${i.number} (${formatDate(i.date)}): ${settings.currency} ${money(i.total - (i.paidAmount || 0))}${i.meta && i.meta.dueDate ? ' · due ' + formatDate(i.meta.dueDate) : ''}\n`;
+    });
+    if (docs.length > 6) t += `…and ${docs.length - 6} more\n`;
+    t += `\nKindly arrange the payment at your earliest convenience.`;
+    if (settings.paymentNote) t += `\n${settings.paymentNote}`;
+    if (settings.phone) t += `\nContact: ${settings.phone}`;
+    t += `\n\nThank you!`;
+    return t;
+  }
+  // Local numbers like 0300-1234567 need the country code for wa.me
+  function waNumber(phone) {
+    let d = (phone || '').replace(/\D/g, '');
+    const cc = { PKR: '92', INR: '91', BDT: '880' }[settings.currency];
+    if (cc && d.startsWith('0')) d = cc + d.slice(1);
+    return d;
+  }
+  function sendWhatsApp(phone, text) {
+    window.open(`https://wa.me/${waNumber(phone)}?text=${encodeURIComponent(text)}`, '_blank');
+  }
+  function custOfInvoice(inv) {
+    return customers.find(c => c.id === inv.customerId) || { id: inv.customerId, name: inv.customerName, phone: inv.customerPhone };
+  }
+
+  function openStatement(cust) {
+    const rows = customerLedger(cust);
+    const bal = customerBalance(cust.id, cust.name, cust.phone);
+    $('#modalRoot').innerHTML = `
+      <div class="modal-overlay"><div class="modal-sheet">
+        <div class="modal-handle"></div>
+        <div class="modal-header"><h3 class="modal-title">Statement · ${escapeHtml(cust.name)}</h3>
+          <button class="modal-close" data-action="close-modal"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button></div>
+        <div class="stats-grid mb-16">
+          <div class="stat-card"><div class="stat-label">Net Sales</div><div class="stat-value primary">${settings.currency} ${money(bal.total)}</div></div>
+          <div class="stat-card"><div class="stat-label">${bal.credit > 0 ? 'Credit' : 'Balance due'}</div><div class="stat-value ${bal.due > 0 ? 'danger' : 'success'}">${settings.currency} ${money(bal.credit > 0 ? bal.credit : bal.due)}</div></div>
+        </div>
+        ${rows.length ? `<div class="ledger">${rows.slice().reverse().map(r => `
+          <div class="led-row"><div class="led-main"><div class="led-text">${escapeHtml(r.text)}</div><div class="text-sm text-secondary">${formatDate(r.date)}</div></div>
+            <div class="led-amts"><div class="${r.debit ? 'led-dr' : 'led-cr'}">${r.debit ? '+' : '−'}${money(r.debit || r.credit)}</div><div class="text-sm text-secondary">Bal ${money(r.balance)}</div></div></div>`).join('')}</div>` : '<div class="doc-empty">No transactions yet</div>'}
+        <div class="flex gap-8 mt-16">
+          <button class="btn btn-secondary" style="flex:1" data-action="statement-pdf" data-id="${cust.id}">PDF</button>
+          <button class="btn btn-primary" style="flex:1" data-action="statement-wa" data-id="${cust.id}">WhatsApp</button>
+        </div>
+      </div></div>`;
+  }
+
+  function statementPDF(cust) {
+    const { jsPDF } = window.jspdf;
+    const doc = new jsPDF({ unit: 'mm', format: 'a4' });
+    const W = 210, m = 16;
+    const TH = HisablyReceipt.themeOf(settings), D = HisablyReceipt.hexRgb(TH.dark);
+    const rows = customerLedger(cust);
+    const bal = customerBalance(cust.id, cust.name, cust.phone);
+    let y = 20;
+    doc.setFont('helvetica', 'bold'); doc.setFontSize(16); doc.setTextColor(D[0], D[1], D[2]);
+    doc.text(settings.businessName || 'Business', m, y);
+    doc.setFontSize(11); doc.text('STATEMENT OF ACCOUNT', W - m, y, { align: 'right' });
+    y += 8; doc.setFontSize(9); doc.setFont('helvetica', 'normal'); doc.setTextColor(100);
+    if (settings.phone) { doc.text(settings.phone, m, y); }
+    doc.text('Date: ' + formatDate(new Date().toISOString()), W - m, y, { align: 'right' });
+    y += 8; doc.setTextColor(15, 23, 42); doc.setFont('helvetica', 'bold'); doc.setFontSize(11);
+    doc.text('Customer: ' + cust.name, m, y); y += 5;
+    doc.setFont('helvetica', 'normal'); doc.setFontSize(9); doc.setTextColor(100);
+    if (cust.phone) { doc.text(cust.phone, m, y); y += 5; }
+    y += 3;
+    const head = () => {
+      doc.setFillColor(241, 245, 249); doc.roundedRect(m, y, W - 2 * m, 8, 1.5, 1.5, 'F');
+      doc.setFont('helvetica', 'bold'); doc.setFontSize(8); doc.setTextColor(100);
+      doc.text('DATE', m + 3, y + 5.5); doc.text('DETAILS', m + 28, y + 5.5);
+      doc.text('DEBIT', m + 118, y + 5.5, { align: 'right' }); doc.text('CREDIT', m + 144, y + 5.5, { align: 'right' }); doc.text('BALANCE', W - m - 3, y + 5.5, { align: 'right' });
+      y += 12;
+    };
+    head();
+    doc.setFont('helvetica', 'normal'); doc.setFontSize(8.5); doc.setTextColor(15, 23, 42);
+    rows.forEach(r => {
+      if (y > 275) { doc.addPage(); y = 20; head(); doc.setFont('helvetica', 'normal'); doc.setFontSize(8.5); doc.setTextColor(15, 23, 42); }
+      doc.text(formatDate(r.date), m + 3, y);
+      const t = doc.splitTextToSize(r.text, 82);
+      doc.text(t[0], m + 28, y);
+      if (r.debit) doc.text(money(r.debit), m + 118, y, { align: 'right' });
+      if (r.credit) doc.text(money(r.credit), m + 144, y, { align: 'right' });
+      doc.text(money(r.balance), W - m - 3, y, { align: 'right' });
+      y += 6.5;
+    });
+    if (y > 262) { doc.addPage(); y = 20; }
+    y += 4; doc.setDrawColor(226, 232, 240); doc.line(m, y, W - m, y); y += 8;
+    doc.setFont('helvetica', 'bold'); doc.setFontSize(11); doc.setTextColor(D[0], D[1], D[2]);
+    doc.text(bal.credit > 0 ? 'Credit with us' : 'Balance due', W - m - 60, y);
+    doc.text(`${settings.currency} ${money(bal.credit > 0 ? bal.credit : bal.due)}`, W - m, y, { align: 'right' });
+    doc.save(`Statement-${(cust.name || 'customer').replace(/[^a-z0-9]+/gi, '-')}.pdf`);
+  }
+
+  // ---------- Security: PIN lock + staff mode ----------
+  // Device-level protection (keeps casual access out). It is not a server-side permission system.
+  const ROLE_KEY = 'hisably_role_v1';
+  const STAFF_VIEWS = ['dashboard', 'products', 'create-invoice', 'invoices', 'customers', 'more'];
+  const STAFF_BLOCK = /^(add-product|edit-product|delete-|bulk-|stock-in|open-settings|open-plans|open-shopify|shopify-|export-data|import-data|clear-data|add-expense|edit-expense|new-purchase|view-purchase|purchase-|view-supplier|pay-supplier|add-supplier|edit-supplier|cloud-auth|sign-out-user|submit-payment|db-|pick-|remove-|pin-)/;
+  let _lastHidden = 0, _pinFails = 0, _pinWaitUntil = 0;
+  function lockEnabled() { return !!settings.pinHash && !!(window.HisablyFreemium && HisablyFreemium.hasFeature('passcode')); }
+  function getRole() { try { return sessionStorage.getItem(ROLE_KEY) || ''; } catch (e) { return ''; } }
+  function setRole(r) { try { if (r) sessionStorage.setItem(ROLE_KEY, r); else sessionStorage.removeItem(ROLE_KEY); } catch (e) {} }
+  function isStaff() { return lockEnabled() && getRole() === 'staff'; }
+  async function pinHash(pin) {
+    const str = `${settings.pinSalt || ''}:${pin}`;
+    try {
+      if (window.crypto && crypto.subtle) {
+        const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(str));
+        return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join('');
+      }
+    } catch (e) {}
+    let h = 5381;                                   // fallback where crypto.subtle is unavailable
+    for (let r = 0; r < 2000; r++) for (let i = 0; i < str.length; i++) h = ((h * 33) ^ str.charCodeAt(i) ^ r) >>> 0;
+    return 'f' + h.toString(16);
+  }
+
+  function showLock(mode) {
+    if (!lockEnabled()) return;
+    setRole('');
+    let el = document.getElementById('lockScreen');
+    if (!el) { el = document.createElement('div'); el.id = 'lockScreen'; el.className = 'lock-screen'; document.body.appendChild(el); }
+    el.hidden = false;
+    if (mode === 'forgot') renderForgot(el); else renderLock(el, '');
+  }
+  function hideLock() { const el = document.getElementById('lockScreen'); if (el) el.hidden = true; }
+  function renderLock(el, entered, msg) {
+    const keys = ['1', '2', '3', '4', '5', '6', '7', '8', '9', '', '0', '⌫'];
+    el.innerHTML = `<div class="lock-box">
+      <div class="logo-circle" style="margin:0 auto 12px">H</div>
+      <div class="lock-title">${escapeHtml(settings.businessName || 'Hisably')}</div>
+      <div class="lock-sub">${msg ? escapeHtml(msg) : 'Enter your PIN'}</div>
+      <div class="lock-dots">${[0, 1, 2, 3].map(i => `<span class="${i < entered.length ? 'on' : ''}"></span>`).join('')}</div>
+      <div class="lock-pad">${keys.map(k => k === '' ? '<span></span>' : `<button type="button" data-k="${k}">${k}</button>`).join('')}</div>
+      <button type="button" class="lock-link" data-lock="forgot">Forgot PIN?</button></div>`;
+    el.querySelectorAll('[data-k]').forEach(b => b.addEventListener('click', () => keyPress(el, entered, b.dataset.k)));
+    const f = el.querySelector('[data-lock="forgot"]'); if (f) f.addEventListener('click', () => renderForgot(el));
+  }
+  async function keyPress(el, entered, k) {
+    if (k === '⌫') return renderLock(el, entered.slice(0, -1));
+    if (entered.length >= 4) return;
+    entered += k;
+    renderLock(el, entered);
+    if (entered.length < 4) return;
+    if (Date.now() < _pinWaitUntil) { renderLock(el, '', `Too many tries. Wait ${Math.ceil((_pinWaitUntil - Date.now()) / 1000)}s`); return; }
+    const h = await pinHash(entered);
+    if (h === settings.pinHash) { _pinFails = 0; setRole('owner'); hideLock(); render(); return; }
+    if (settings.staffHash && h === settings.staffHash) { _pinFails = 0; setRole('staff'); hideLock(); setView('dashboard'); return; }
+    _pinFails++;
+    if (_pinFails >= 5) { _pinWaitUntil = Date.now() + 30000; _pinFails = 0; }
+    const box = el.querySelector('.lock-box'); if (box) box.classList.add('shake');
+    setTimeout(() => renderLock(el, '', 'Wrong PIN'), 350);
+  }
+  function renderForgot(el) {
+    const cloud = window.HisablyCloud && HisablyCloud.ready() && HisablyCloud.getSession();
+    el.innerHTML = `<div class="lock-box">
+      <div class="lock-title">Reset PIN</div>
+      ${cloud ? `<div class="lock-sub">Enter your account password to remove the PIN lock.</div>
+        <input type="password" class="form-input" id="lockPw" placeholder="Account password" autocomplete="current-password" />
+        <button type="button" class="btn btn-primary btn-block mt-12" id="lockReset">Remove PIN lock</button>`
+        : `<div class="lock-sub">Sign in to your cloud account on this device to reset the PIN. Without a cloud account the PIN cannot be reset.</div>`}
+      <button type="button" class="lock-link" id="lockBack">Back</button></div>`;
+    el.querySelector('#lockBack').addEventListener('click', () => renderLock(el, ''));
+    const rb = el.querySelector('#lockReset');
+    if (rb) rb.addEventListener('click', async () => {
+      const pw = el.querySelector('#lockPw').value;
+      const email = HisablyCloud.getSession().user.email;
+      rb.disabled = true;
+      try { await HisablyCloud.signIn(email, pw); settings.pinHash = ''; settings.staffHash = ''; persist(); setRole('owner'); hideLock(); toast('PIN lock removed'); render(); }
+      catch (e) { toast('Wrong password'); rb.disabled = false; }
+    });
+  }
+  function openPinModal(kind) {
+    const staff = kind === 'staff';
+    if (!window.HisablyFreemium || !HisablyFreemium.hasFeature('passcode')) { toast('PIN lock and staff mode are Pro features.', 4500); openPlansModal && openPlansModal(); return; }
+    if (staff && !settings.pinHash) { toast('Set the owner PIN first'); return; }
+    $('#modalRoot').innerHTML = `
+      <div class="modal-overlay"><div class="modal-sheet">
+        <div class="modal-handle"></div>
+        <div class="modal-header"><h3 class="modal-title">${staff ? 'Staff PIN' : 'Owner PIN'}</h3>
+          <button class="modal-close" data-action="close-modal"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button></div>
+        <div class="text-sm text-secondary mb-8">${staff ? 'Staff can make sales, quotations and returns and receive payments. They cannot see profit, costs, reports or settings, and cannot delete anything.' : 'The owner PIN opens everything. Choose 4 digits you will remember.'}</div>
+        <form id="pinForm" autocomplete="off">
+          <div class="form-group"><label class="form-label">New PIN (4 digits)</label><input type="password" inputmode="numeric" maxlength="4" pattern="[0-9]{4}" class="form-input" id="pin1" /></div>
+          <div class="form-group"><label class="form-label">Repeat PIN</label><input type="password" inputmode="numeric" maxlength="4" pattern="[0-9]{4}" class="form-input" id="pin2" /></div>
+          <button type="submit" class="btn btn-primary btn-block mt-12">Save PIN</button>
+        </form></div></div>`;
+    document.getElementById('pinForm').addEventListener('submit', async e => {
+      e.preventDefault();
+      const a = document.getElementById('pin1').value, b = document.getElementById('pin2').value;
+      if (!/^\d{4}$/.test(a)) { toast('PIN must be 4 digits'); return; }
+      if (a !== b) { toast('PINs do not match'); return; }
+      if (!settings.pinSalt) settings.pinSalt = uid().replace(/-/g, '');
+      const h = await pinHash(a);
+      if (staff && h === settings.pinHash) { toast('Staff PIN must be different from the owner PIN'); return; }
+      if (!staff && settings.staffHash && h === settings.staffHash) { toast('Owner PIN must be different from the staff PIN'); return; }
+      if (staff) settings.staffHash = h; else { settings.pinHash = h; setRole('owner'); }
+      persist(); toast(staff ? 'Staff PIN saved' : 'Owner PIN saved. The app will lock when you leave it.');
+      openSettingsModal();
+    });
+  }
+  function themePickerHTML() {
+    const cur = settings.invoiceTheme || 'teal';
+    const ok = window.HisablyFreemium && HisablyFreemium.hasFeature('themes');
+    const T = HisablyReceipt.THEMES;
+    const th = T[cur] || T.teal, band = th.style === 'band';
+    return `<div class="doc-card" id="themePicker" style="margin-top:12px">
+      <div class="doc-label">Invoice style (PDF, image &amp; A4 print)</div>
+      <div class="chip-row mb-8">${Object.keys(T).map(k => `<button type="button" class="cat-chip${k === cur ? ' active' : ''}" data-action="pick-theme" data-theme="${k}"><span class="theme-dot" style="background:${T[k].accent}"></span>${T[k].name}${T[k].pro && !ok ? ' 🔒' : ''}</button>`).join('')}</div>
+      <div class="theme-prev" style="${band ? `background:${th.accent};color:#fff` : `border-bottom:3px solid ${th.accent}`}">
+        <b>${escapeHtml(settings.businessName || 'Your business')}</b><span>INVOICE</span></div>
+      <div class="theme-prev-tot" style="background:${th.soft};color:${th.dark}"><span>Total</span><b>${escapeHtml(settings.currency || '')} 1,000</b></div>
+      ${ok ? '' : '<div class="text-sm text-secondary mt-8">🔒 More styles are available on Pro.</div>'}
+    </div>`;
+  }
+  function securityHTML() {
+    const ok = window.HisablyFreemium && HisablyFreemium.hasFeature('passcode');
+    return `<div class="doc-card" style="margin-top:12px">
+      <div class="doc-label">App lock &amp; staff ${ok ? '' : '<span style="font-size:10px;background:var(--primary);color:#fff;border-radius:6px;padding:1px 6px;margin-left:6px">PRO</span>'}</div>
+      <div class="text-sm text-secondary mb-8">${settings.pinHash ? 'Lock is ON.' + (settings.staffHash ? ' Staff PIN is set.' : ' No staff PIN yet.') : 'Protect the app with a PIN and give your staff a limited login.'}</div>
+      <div class="flex gap-8" style="flex-wrap:wrap">
+        <button type="button" class="btn btn-secondary btn-sm" data-action="pin-set-owner">${settings.pinHash ? 'Change owner PIN' : 'Set owner PIN'}</button>
+        ${settings.pinHash ? `<button type="button" class="btn btn-secondary btn-sm" data-action="pin-set-staff">${settings.staffHash ? 'Change staff PIN' : 'Set staff PIN'}</button>
+        <button type="button" class="btn btn-ghost btn-sm" data-action="pin-remove">Remove lock</button>` : ''}
+      </div></div>`;
+  }
+  function staffMoreHTML() {
+    return `<div class="fade-in">
+      <div class="card mb-16"><div class="text-sm text-secondary">Signed in as</div><div class="font-semibold" style="font-size:1.0625rem">Staff</div></div>
+      <div class="menu-list mb-16">
+        <button class="menu-item" data-view="customers">Customers<svg class="menu-item-arrow" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="9 18 15 12 9 6"/></svg></button>
+        <button class="menu-item" data-action="cloud-sync">Sync now<svg class="menu-item-arrow" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="9 18 15 12 9 6"/></svg></button>
+        <button class="menu-item" data-action="lock-now">Lock app<svg class="menu-item-arrow" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="9 18 15 12 9 6"/></svg></button>
+      </div></div>`;
+  }
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) { _lastHidden = Date.now(); return; }
+    if (lockEnabled() && _lastHidden && Date.now() - _lastHidden > 60000) showLock();
+  });
+
+  // ---------- Day Book / cash flow ----------
+  let dbRange = 'today', dbMode = 'all';
+  const PAY_MODES = ['Cash', 'Bank', 'Online', 'Cheque'];
+  function dayKey(iso) {
+    if (/^\d{4}-\d{2}-\d{2}$/.test(String(iso))) return iso;
+    const d = new Date(iso);
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+  }
+  function modeChips(id) {
+    return `<div class="chip-row mt-8" id="${id}">${PAY_MODES.map((m, i) => `<button type="button" class="cat-chip${i ? '' : ' active'}" data-action="rp-mode" data-mode="${m}">${m}</button>`).join('')}</div>`;
+  }
+  function pickedMode(id) {
+    const a = document.querySelector('#' + id + ' .cat-chip.active');
+    return a ? a.dataset.mode : 'Cash';
+  }
+  // Every rupee that actually moved: payments in, refunds / purchase payments / expenses out
+  function cashEntries() {
+    const out = [];
+    const split = (doc, label, dir, party) => {
+      const pays = (doc.meta && doc.meta.payments) || [];
+      const first = round2((doc.paidAmount || 0) - pays.reduce((s, p) => s + p.amount, 0));
+      if (first > 0.001) out.push({ date: doc.date, mode: (doc.meta && doc.meta.paymentMode) || 'Cash', dir, amount: first, text: `${label} ${doc.number}`, party });
+      pays.forEach(p => out.push({ date: p.date, mode: p.mode || 'Cash', dir, amount: p.amount, text: `${label} ${doc.number}${p.note ? ' · ' + p.note : ''}`, party }));
+    };
+    invoices.forEach(inv => {
+      const g = docSign(inv); if (!g) return;
+      if (g > 0) split(inv, 'Payment in', 'in', inv.customerName);
+      else split(inv, 'Refund', 'out', inv.customerName);
+    });
+    purchases.forEach(p => split(p, 'Paid for', 'out', p.supplierName));
+    expenses.forEach(e => out.push({ date: e.date, mode: 'Cash', dir: 'out', amount: e.amount || 0, text: 'Expense · ' + (e.title || e.category || ''), party: '' }));
+    out.forEach(r => { r.day = dayKey(r.date); r.t = /^\d{4}-\d{2}-\d{2}$/.test(String(r.date)) ? ts(r.date + 'T12:00:00') : ts(r.date); });
+    return out.filter(r => r.amount > 0).sort((a, b) => b.t - a.t);
+  }
+  function viewDayBook() {
+    const now = new Date();
+    const key = off => { const d = new Date(now); d.setDate(d.getDate() - off); return dayKey(d.toISOString()); };
+    const ranges = { today: [key(0), key(0)], yesterday: [key(1), key(1)], week: [key(6), key(0)], month: [key(29), key(0)], all: ['0000', '9999'] };
+    const [from, to] = ranges[dbRange] || ranges.today;
+    const all = cashEntries().filter(r => r.day >= from && r.day <= to);
+    const rows = all.filter(r => dbMode === 'all' || r.mode === dbMode);
+    const sum = (list, dir) => round2(list.filter(r => r.dir === dir).reduce((s, r) => s + r.amount, 0));
+    const inn = sum(rows, 'in'), outt = sum(rows, 'out'), net = round2(inn - outt);
+    const cur = settings.currency;
+    const rl = [['today', 'Today'], ['yesterday', 'Yesterday'], ['week', '7 days'], ['month', '30 days'], ['all', 'All']];
+    const modes = ['all'].concat(PAY_MODES);
+    const byMode = PAY_MODES.map(m => { const l = all.filter(r => r.mode === m); return { m, i: sum(l, 'in'), o: sum(l, 'out') }; }).filter(x => x.i || x.o);
+    const days = [];
+    rows.forEach(r => { let d = days[days.length - 1]; if (!d || d.day !== r.day) { d = { day: r.day, list: [] }; days.push(d); } d.list.push(r); });
+    return `<div class="fade-in">
+      <div class="cat-chips">${rl.map(r => `<button class="cat-chip${dbRange === r[0] ? ' active' : ''}" data-action="db-range" data-v="${r[0]}">${r[1]}</button>`).join('')}</div>
+      <div class="cat-chips">${modes.map(m => `<button class="cat-chip${dbMode === m ? ' active' : ''}" data-action="db-mode" data-v="${m}">${m === 'all' ? 'All modes' : m}</button>`).join('')}</div>
+      <div class="stats-grid" style="grid-template-columns:repeat(2,1fr)">
+        <div class="stat-card"><div class="stat-label">Money In</div><div class="stat-value success" style="font-size:1.125rem">${cur} ${money(inn)}</div></div>
+        <div class="stat-card"><div class="stat-label">Money Out</div><div class="stat-value danger" style="font-size:1.125rem">${cur} ${money(outt)}</div></div>
+      </div>
+      <div class="doc-card tot-row" style="margin-top:-4px"><span>Net cash flow</span><b style="color:var(--${net >= 0 ? 'success' : 'danger'})">${net < 0 ? '−' : ''}${cur} ${money(Math.abs(net))}</b></div>
+      ${byMode.length ? `<div class="doc-card"><div class="doc-label">By payment mode</div>${byMode.map(x => `
+        <div class="tot-row"><span>${x.m}</span><span class="text-sm"><span style="color:var(--success)">+${money(x.i)}</span> &nbsp; <span style="color:var(--danger)">−${money(x.o)}</span> &nbsp; <b>${money(round2(x.i - x.o))}</b></span></div>`).join('')}</div>` : ''}
+      ${days.length === 0 ? '<div class="doc-empty">No money moved in this period</div>' : days.map(d => {
+        const dn = round2(sum(d.list, 'in') - sum(d.list, 'out'));
+        return `<div class="section-header"><h2 class="section-title">${formatDate(d.day + 'T12:00:00')}</h2><span class="text-sm" style="color:var(--${dn >= 0 ? 'success' : 'danger'});font-weight:700">${dn < 0 ? '−' : ''}${money(Math.abs(dn))}</span></div>
+        <div class="list">${d.list.map(r => `
+          <div class="list-item"><div class="list-item-body"><div class="list-item-title">${escapeHtml(r.text)}</div>
+            <div class="list-item-sub">${escapeHtml(r.party || '')}${r.party ? ' · ' : ''}${escapeHtml(r.mode)}</div></div>
+            <div class="list-item-right"><div class="list-item-price" style="color:var(--${r.dir === 'in' ? 'success' : 'danger'})">${r.dir === 'in' ? '+' : '−'}${money(r.amount)}</div></div></div>`).join('')}</div>`;
+      }).join('')}
+    </div>`;
+  }
+
+  // ---------- Purchases & supplier payables ----------
+  function nextPurNumber() {
+    let mx = 1000;
+    purchases.forEach(p => { const m = String(p.number).match(/(\d+)\s*$/); if (m) mx = Math.max(mx, parseInt(m[1], 10)); });
+    return `PUR-${mx + 1}`;
+  }
+  function supplierOf(p) {
+    return suppliers.find(s => s.id === p.supplierId) || { id: p.supplierId, name: p.supplierName, phone: p.supplierPhone };
+  }
+  function supplierPurchases(sup) {
+    return purchases.filter(p => (sup.id && p.supplierId === sup.id) || (!p.supplierId && p.supplierName && p.supplierName.toLowerCase() === (sup.name || '').toLowerCase()));
+  }
+  function supplierBalance(sup) {
+    let total = 0, paid = 0;
+    supplierPurchases(sup).forEach(p => { total += p.total || 0; paid += p.paidAmount || 0; });
+    return { total, paid, due: Math.max(0, round2(total - paid)) };
+  }
+  function totalPayable() {
+    return round2(purchases.reduce((s, p) => s + Math.max(0, (p.total || 0) - (p.paidAmount || 0)), 0));
+  }
+
+  function listPurchase(p) {
+    const paid = p.paidAmount || 0, due = Math.max(0, (p.total || 0) - paid);
+    const badge = due <= 0.001 ? '<span class="list-item-badge badge-ok">Paid</span>'
+      : (paid > 0 ? `<span class="list-item-badge badge-low">Owe ${settings.currency} ${money(due)}</span>` : '<span class="list-item-badge badge-out">Unpaid</span>');
+    return `<div class="list-item" data-action="view-purchase" data-id="${p.id}">
+      <div class="list-item-icon">${initials(p.supplierName || 'S')}</div>
+      <div class="list-item-body">
+        <div class="list-item-title">${escapeHtml(p.supplierName || 'Unknown supplier')}</div>
+        <div class="list-item-sub">${escapeHtml(p.number)} · ${formatDate(p.date)} · ${p.items.length} item${p.items.length !== 1 ? 's' : ''}</div>
+        ${badge}${isOverdue(p) ? ' <span class="list-item-badge badge-out">Overdue</span>' : ''}
+      </div>
+      <div class="list-item-right"><div class="list-item-price">${settings.currency} ${money(p.total)}</div></div>
+    </div>`;
+  }
+  function viewPurchases() {
+    if (purchases.length === 0) {
+      return emptyState('box', 'No purchases yet', 'Record stock you buy from suppliers. Stock goes up and you can track what you owe.', 'Add Purchase', null, 'new-purchase');
+    }
+    const owe = totalPayable();
+    const list = [...purchases].sort((a, b) => ts(b.date) - ts(a.date));
+    return `<div class="fade-in">
+      <div class="stats-grid" style="grid-template-columns:repeat(2,1fr)">
+        <div class="stat-card"><div class="stat-label">Total Bought</div><div class="stat-value primary" style="font-size:1.125rem">${settings.currency} ${money(purchases.reduce((s, p) => s + (p.total || 0), 0))}</div></div>
+        <div class="stat-card"><div class="stat-label">To Pay</div><div class="stat-value ${owe > 0 ? 'danger' : 'success'}" style="font-size:1.125rem">${settings.currency} ${money(owe)}</div></div>
+      </div>
+      <div class="list">${list.map(listPurchase).join('')}</div></div>`;
+  }
+
+  function openPurchaseDetail(p) {
+    const paid = p.paidAmount || 0, due = Math.max(0, round2((p.total || 0) - paid));
+    const x = invExtraRows(p);
+    const pays = (p.meta && p.meta.payments) || [];
+    const first = round2(paid - pays.reduce((s, q) => s + q.amount, 0));
+    $('#modalRoot').innerHTML = `
+      <div class="modal-overlay"><div class="modal-sheet">
+        <div class="modal-handle"></div>
+        <div class="modal-header"><h3 class="modal-title">Purchase ${escapeHtml(p.number)}</h3>
+          <button class="modal-close" data-action="close-modal"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button></div>
+        <div class="mb-16"><div class="text-sm text-secondary">Supplier</div><div class="font-semibold">${escapeHtml(p.supplierName || 'Unknown')}</div>
+          <div class="text-sm text-secondary mt-8">${formatDate(p.date)}${p.meta && p.meta.billNo ? ' · Bill ' + escapeHtml(p.meta.billNo) : ''}</div></div>
+        <div class="invoice-summary">
+          ${p.items.map(it => `<div class="summary-row"><span>${escapeHtml(it.name)} × ${it.qty} @ ${money(it.price)}</span><span>${settings.currency} ${money(it.price * it.qty)}</span></div>`).join('')}
+          ${x.rows.length ? `<div class="summary-row"><span>Subtotal</span><span>${settings.currency} ${money(x.sub)}</span></div>` + x.rows.map(r => `<div class="summary-row"><span>${escapeHtml(r.label)}</span><span>${r.amt < 0 ? '−' : ''}${settings.currency} ${money(Math.abs(r.amt))}</span></div>`).join('') : ''}
+          <div class="summary-row total"><span>Total</span><span>${settings.currency} ${money(p.total)}</span></div>
+          <div class="summary-row"><span>Paid</span><span style="color:var(--success)">${settings.currency} ${money(paid)}</span></div>
+          <div class="summary-row"><span>Balance to pay</span><span style="color:${due > 0 ? 'var(--danger)' : 'var(--success)'}">${settings.currency} ${money(due)}</span></div>
+          ${p.meta && p.meta.dueDate ? `<div class="summary-row"><span>Due date</span><span${isOverdue(p) ? ' style="color:var(--danger);font-weight:600"' : ''}>${formatDate(p.meta.dueDate)}${isOverdue(p) ? ' · overdue' : ''}</span></div>` : ''}
+        </div>
+        ${(first > 0.001 || pays.length) ? `<div class="doc-label mt-16">Payments made</div>
+          ${first > 0.001 ? `<div class="summary-row"><span>${formatDate(p.date)}${p.meta && p.meta.paymentMode ? ' · ' + escapeHtml(p.meta.paymentMode) : ''}</span><span>${settings.currency} ${money(first)}</span></div>` : ''}
+          ${pays.map(q => `<div class="summary-row"><span>${formatDate(q.date)} · ${escapeHtml(q.mode || '')}${q.note ? ' · ' + escapeHtml(q.note) : ''}</span><span>${settings.currency} ${money(q.amount)}</span></div>`).join('')}` : ''}
+        ${due > 0.001 ? `
+        <div class="form-group mt-16"><label class="form-label">Record payment to supplier</label>
+          <div class="input-with-btn"><input type="number" class="form-input" id="recordPayInput" min="0" step="any" placeholder="Amount" />
+            <button type="button" class="btn btn-primary btn-sm" style="height:48px" data-action="purchase-pay" data-id="${p.id}">Add</button></div>${modeChips('rpMode')}</div>
+        <button class="btn btn-secondary btn-block mt-8" data-action="purchase-pay-full" data-id="${p.id}">Mark as Fully Paid</button>` : ''}
+      </div></div>`;
+  }
+
+  function openSupplierDetail(sup) {
+    const bal = supplierBalance(sup);
+    const list = supplierPurchases(sup).sort((a, b) => ts(b.date) - ts(a.date));
+    $('#modalRoot').innerHTML = `
+      <div class="modal-overlay"><div class="modal-sheet">
+        <div class="modal-handle"></div>
+        <div class="modal-header"><h3 class="modal-title">${escapeHtml(sup.name)}</h3>
+          <button class="modal-close" data-action="close-modal"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button></div>
+        <div class="text-sm text-secondary mb-8">${escapeHtml(sup.phone || 'No phone')}</div>
+        <div class="stats-grid mb-16">
+          <div class="stat-card"><div class="stat-label">Total Bought</div><div class="stat-value primary">${settings.currency} ${money(bal.total)}</div></div>
+          <div class="stat-card"><div class="stat-label">You Owe</div><div class="stat-value ${bal.due > 0 ? 'danger' : 'success'}">${settings.currency} ${money(bal.due)}</div></div>
+        </div>
+        <div class="section-header"><h2 class="section-title">Purchase history</h2></div>
+        ${list.length ? `<div class="list">${list.map(listPurchase).join('')}</div>` : '<div class="text-secondary text-sm">No purchases yet</div>'}
+        <div class="flex gap-8 mt-16">
+          ${bal.due > 0 ? `<button class="btn btn-primary" style="flex:1" data-action="pay-supplier" data-id="${sup.id}">Pay Supplier</button>` : ''}
+          <button class="btn btn-secondary" style="flex:1" data-action="edit-supplier" data-id="${sup.id}">Edit</button>
+        </div>
+      </div></div>`;
+  }
+
+  function openPaySupplierModal(sup) {
+    const bal = supplierBalance(sup);
+    const today = new Date().toISOString().slice(0, 10);
+    $('#modalRoot').innerHTML = `
+      <div class="modal-overlay"><div class="modal-sheet">
+        <div class="modal-handle"></div>
+        <div class="modal-header"><h3 class="modal-title">Pay Supplier</h3>
+          <button class="modal-close" data-action="close-modal"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button></div>
+        <div class="text-secondary text-sm mb-8">${escapeHtml(sup.name)} · You owe ${settings.currency} ${money(bal.due)}</div>
+        <form id="paySupForm" autocomplete="off">
+          <div class="form-group"><label class="form-label">Amount (${settings.currency})</label><input type="number" inputmode="decimal" class="form-input" id="psAmt" min="0" step="any" value="${bal.due}" /></div>
+          <div class="chip-row mb-8" id="psMode"><button type="button" class="cat-chip active" data-mode="Cash">Cash</button><button type="button" class="cat-chip" data-mode="Bank">Bank</button><button type="button" class="cat-chip" data-mode="Online">Online</button><button type="button" class="cat-chip" data-mode="Cheque">Cheque</button></div>
+          <div class="form-row"><div class="form-group"><label class="form-label">Date</label><input type="date" class="form-input" id="psDate" value="${today}" max="${today}" /></div>
+            <div class="form-group"><label class="form-label">Note</label><input type="text" class="form-input" id="psNote" maxlength="40" placeholder="Optional" /></div></div>
+          <div class="text-sm text-secondary">Settles the oldest unpaid purchases first.</div>
+          <button type="submit" class="btn btn-primary btn-block mt-16">Save Payment</button>
+        </form></div></div>`;
+    let mode = 'Cash';
+    document.querySelectorAll('#psMode .cat-chip').forEach(b => b.addEventListener('click', () => { mode = b.dataset.mode; document.querySelectorAll('#psMode .cat-chip').forEach(x => x.classList.toggle('active', x === b)); }));
+    document.getElementById('paySupForm').addEventListener('submit', e => {
+      e.preventDefault();
+      let amt = round2(parseFloat(document.getElementById('psAmt').value) || 0);
+      if (amt <= 0) { toast('Enter an amount'); return; }
+      if (amt > bal.due + 0.001) { toast(`You only owe ${settings.currency} ${money(bal.due)}`, 3500); return; }
+      const d = document.getElementById('psDate').value;
+      const dateIso = (d && d !== today) ? new Date(d + 'T12:00:00').toISOString() : new Date().toISOString();
+      const note = document.getElementById('psNote').value.trim();
+      let n = 0;
+      supplierPurchases(sup).filter(p => (p.total || 0) - (p.paidAmount || 0) > 0.001).sort((a, b) => ts(a.date) - ts(b.date)).forEach(p => {
+        if (amt <= 0.001) return;
+        const used = addPayment(p, amt, mode, note, dateIso); if (used > 0) { amt = round2(amt - used); n++; }
+      });
+      persist(); toast(`Payment saved · ${n} purchase${n !== 1 ? 's' : ''} updated`); render(); openSupplierDetail(sup);
+    });
+  }
+
+  // ---------- Create Invoice (Vyapar-style document form) ----------
+  // Totals math shared by the form, detail view, PDF, receipt and WhatsApp text.
+  function calcDoc(lines, o) {
+    o = o || {};
+    const sub = round2(lines.reduce((s, l) => s + (Number(l.price) || 0) * (Number(l.qty) || 0), 0));
+    let discount = o.discType === 'pct' ? sub * (Number(o.discValue) || 0) / 100 : (Number(o.discValue) || 0);
+    discount = round2(Math.min(Math.max(discount, 0), sub));
+    const taxable = round2(sub - discount);
+    const taxRate = Math.max(0, Number(o.taxRate) || 0);
+    const tax = round2(taxable * taxRate / 100);
+    const charges = round2(Math.max(0, Number(o.charges) || 0));
+    const raw = taxable + tax + charges;
+    const total = o.roundOff ? Math.round(raw) : round2(raw);
+    const roundOff = round2(total - raw);
+    return { sub, discount, taxable, taxRate, tax, charges, roundOff, total };
+  }
+  // Extra rows (discount/tax/charges/round-off) to show under the item list of a saved invoice
+  function invExtraRows(inv) {
+    const m = inv.meta || {};
+    const rows = [];
+    const itemsSub = round2((inv.items || []).reduce((s, i) => s + (i.price || 0) * (i.qty || 0), 0));
+    if (!(m.discount || m.tax || m.charges || m.roundOff)) return { sub: itemsSub, rows };
+    if (m.discount) rows.push({ label: 'Discount' + (m.discType === 'pct' && m.discValue ? ` (${m.discValue}%)` : ''), amt: -m.discount });
+    if (m.tax) rows.push({ label: `${m.taxName || 'Tax'} (${m.taxRate}%)`, amt: m.tax });
+    if (m.charges) rows.push({ label: m.chargeLabel || 'Additional charges', amt: m.charges });
+    if (m.roundOff) rows.push({ label: 'Round off', amt: m.roundOff });
+    return { sub: itemsSub, rows };
+  }
+
   function viewCreateInvoice() {
     if (products.length === 0) {
       return emptyState('box', 'Add products first', 'You need at least one product before creating an invoice.', 'Go to Products', 'products');
     }
-    const available = products.filter(p => p.stock > 0);
     const customerOptions = [
       { value: '', label: 'Walk-in Customer' },
       ...customers.map(c => {
@@ -542,246 +1201,394 @@
         return { value: c.id, label: c.name + (c.phone ? ' · ' + c.phone : ' · no phone') + debt };
       })
     ];
-    return `<div class="fade-in">
-      <form id="invoiceForm">
-        <div class="form-group">
-          <label class="form-label">Customer (searchable)</label>
-          ${customSelect('customerId', customerOptions, '', 'Walk-in Customer', true)}
-        </div>
-        <div class="form-group">
-          <label class="form-label">Or type name</label>
-          <input type="text" class="form-input" name="customerName" id="customerNameInput" placeholder="Customer name" />
-        </div>
-        <div class="form-group">
-          <input type="tel" class="form-input" name="customerPhone" id="customerPhoneInput" placeholder="Phone (optional)" />
+    const today = new Date().toISOString().slice(0, 10);
+    const cur = settings.currency;
+    const isRet = docCtx.type === 'return';
+    const isEst = docCtx.type === 'estimate';
+    const isPur = docCtx.type === 'purchase';
+    const ref = docCtx.ref;
+    const numLabel = isPur ? 'Purchase No.' : isRet ? 'Credit Note No.' : (isEst ? 'Quotation No.' : 'Invoice No.');
+    const numText = isPur ? nextPurNumber() : isRet ? nextDocNumber('CN') : (isEst ? nextDocNumber('QT') : `${settings.invoicePrefix || 'INV'}-${invoiceCounter}`);
+    const supplierOptions = [{ value: '', label: 'Select supplier' }, ...suppliers.map(sp => {
+      const sb = supplierBalance(sp);
+      return { value: sp.id, label: sp.name + (sp.phone ? ' · ' + sp.phone : '') + (sb.due > 0 ? ` · You owe ${settings.currency} ${money(sb.due)}` : '') };
+    })];
+    const from = docCtx.from;
+    return `<div class="fade-in doc-form">
+      <form id="invoiceForm" autocomplete="off">
+        <div class="doc-card doc-head">
+          <div><div class="doc-label">${numLabel}</div><div class="doc-num">${escapeHtml(numText)}</div>${isRet && ref ? `<div class="text-sm text-secondary">Against ${escapeHtml(ref.number)}</div>` : ''}${from ? `<div class="text-sm text-secondary">From ${escapeHtml(from.number)}</div>` : ''}</div>
+          <div class="doc-date"><div class="doc-label">Date</div><input type="date" class="doc-date-input" name="docDate" value="${today}" max="${today}" /></div>
         </div>
 
-        <div class="section-header mt-16">
-          <h2 class="section-title">Products</h2>
-        </div>
-        <div class="search-wrap mb-8">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
-          <input type="search" class="search-input" id="invoiceProductSearch" placeholder="Search products..." />
-        </div>
-        <div class="form-group">
-          <div class="input-with-btn">
-            <input type="text" class="form-input" id="invoiceBarcodeInput" placeholder="Scan or type barcode" />
-            <button type="button" class="btn btn-secondary btn-sm" style="height:48px;padding:0 12px" data-action="scan-invoice-barcode">Scan</button>
+        ${isPur ? `<div class="doc-card doc-head"><div class="doc-label" style="margin:0">Supplier bill no. (optional)</div><input type="text" class="doc-date-input" name="billNo" maxlength="20" style="max-width:150px;border-bottom:1px solid var(--border)" /></div>` : ''}
+        ${isEst ? `<div class="doc-card doc-head"><div class="doc-label" style="margin:0">Valid until (optional)</div><input type="date" class="doc-date-input" name="validUntil" /></div>` : ''}
+        <div class="doc-card">
+          <div class="doc-label">${isPur ? 'Supplier' : 'Bill to'}</div>
+          ${isPur ? customSelect('customerId', supplierOptions, '', 'Select supplier', true) : customSelect('customerId', customerOptions, '', 'Walk-in Customer', true)}
+          <div class="form-row mt-8">
+            <input type="text" class="form-input" name="customerName" id="customerNameInput" placeholder="${isPur ? 'Or type supplier name' : 'Or type customer name'}" />
+            <input type="tel" class="form-input" name="customerPhone" id="customerPhoneInput" placeholder="Phone (optional)" />
           </div>
         </div>
-        <div id="invoiceProducts">
-          ${available.length === 0 ? '<div class="card text-center text-secondary" style="padding:24px">All products are out of stock</div>' :
-            available.map(p => `
-              <div class="invoice-product-row" data-id="${p.id}" data-name="${escapeHtml(p.name.toLowerCase())}" data-barcode="${escapeHtml((p.barcode || '').toLowerCase())}">
-                <div style="flex:1;min-width:0">
-                  <div class="font-semibold">${escapeHtml(p.name)}</div>
-                  <div class="text-sm text-secondary">${settings.currency} ${money(p.price)} · Stock: ${p.stock}${p.barcode ? ' · ' + escapeHtml(p.barcode) : ''}</div>
-                </div>
-                <div class="qty-control">
-                  <button type="button" class="qty-btn" data-qty="-1" data-id="${p.id}">−</button>
-                  <span class="qty-value" id="qty-${p.id}">0</span>
-                  <button type="button" class="qty-btn" data-qty="1" data-id="${p.id}">+</button>
-                </div>
-              </div>`).join('')}
-        </div>
-        <div class="invoice-summary" id="invoiceSummary" style="display:none">
-          <div class="summary-row total"><span>Total</span><span id="invoiceTotal">${settings.currency} 0</span></div>
+
+        <div class="doc-card">
+          <div class="doc-card-head">
+            <span class="doc-label" style="margin:0">Items</span>
+            <span class="doc-actions">
+              <button type="button" class="chip-btn" data-action="scan-invoice-barcode">Scan</button>
+              <button type="button" class="chip-btn chip-btn-primary" id="addItemsBtn">+ Add Items</button>
+            </span>
+          </div>
+          <div id="docLines"></div>
         </div>
 
-        <div class="section-header mt-20"><h2 class="section-title">Payment</h2></div>
-        <div class="payment-status-row" id="paymentStatusRow">
-          <button type="button" class="pay-chip active" data-pay="unpaid">Unpaid</button>
-          <button type="button" class="pay-chip" data-pay="partial">Advance</button>
-          <button type="button" class="pay-chip" data-pay="paid">Fully Paid</button>
-        </div>
-        <input type="hidden" name="paymentStatus" id="paymentStatusInput" value="unpaid" />
-        <div class="form-group mt-12" id="paidAmountGroup" style="display:none">
-          <label class="form-label">Advance / Amount Paid (${settings.currency})</label>
-          <input type="number" class="form-input" name="paidAmount" id="paidAmountInput" min="0" step="0.01" placeholder="0" />
+        <div class="doc-card" id="docTotals" style="display:none">
+          <div class="tot-row"><span>Subtotal</span><b id="tSub"></b></div>
+          <div class="tot-row tot-input">
+            <span>Discount</span>
+            <span class="tot-ctl">
+              <span class="seg" id="discSeg"><button type="button" data-dt="amt" class="on">${escapeHtml(cur)}</button><button type="button" data-dt="pct">%</button></span>
+              <input type="number" inputmode="decimal" min="0" step="any" id="discIn" placeholder="0" />
+            </span>
+          </div>
+          <div class="tot-row tot-input">
+            <span>Tax %</span>
+            <span class="tot-ctl"><input type="number" inputmode="decimal" min="0" step="any" id="taxIn" placeholder="0" value="${(isRet && ref && ref.meta && ref.meta.taxRate) ? ref.meta.taxRate : (from && from.meta && from.meta.taxRate != null ? (from.meta.taxRate || '') : (settings.taxRate ? settings.taxRate : ''))}" /></span>
+          </div>
+          <div class="tot-row tot-input">
+            <span><input type="text" id="chLabel" class="tot-label-in" placeholder="Additional charges" maxlength="30" /></span>
+            <span class="tot-ctl"><input type="number" inputmode="decimal" min="0" step="any" id="chIn" placeholder="0" /></span>
+          </div>
+          <label class="tot-row tot-check"><span>Round off</span><input type="checkbox" id="roundIn" /></label>
+          <div class="tot-sep"></div>
+          <div class="tot-row tot-grand"><span>Total</span><b id="tTotal"></b></div>
         </div>
 
-        <button type="submit" class="btn btn-primary btn-block mt-20" id="createInvoiceBtn" disabled>Create Invoice</button>
+        <div class="doc-card" id="docPay" style="display:none">
+          <div class="doc-card-head">
+            <span class="doc-label" style="margin:0">${isPur ? 'Paid to supplier' : isRet ? 'Refund paid to customer' : 'Payment received'}</span>
+            <label class="paid-toggle"><input type="checkbox" id="paidFull" /> <span>${isPur ? 'Paid in full' : isRet ? 'Refunded in full' : 'Received in full'}</span></label>
+          </div>
+          <input type="number" inputmode="decimal" min="0" step="any" class="form-input" id="paidIn" placeholder="0" name="paidAmount" />
+          <div class="chip-row mt-8" id="modeRow">
+            <button type="button" class="cat-chip active" data-mode="Cash">Cash</button>
+            <button type="button" class="cat-chip" data-mode="Bank">Bank</button>
+            <button type="button" class="cat-chip" data-mode="Online">Online</button>
+            <button type="button" class="cat-chip" data-mode="Cheque">Cheque</button>
+          </div>
+          <div class="tot-row mt-8"><span>${isPur ? 'Balance payable' : isRet ? 'Credit left with customer' : 'Balance due'}</span><b id="tDue"></b></div>
+          ${isRet ? '' : `<div class="tot-row tot-input"><span>Due date</span><span class="tot-ctl"><input type="date" id="dueIn" name="dueDate" min="${today}" style="width:150px" /></span></div>
+          <div class="chip-row"><button type="button" class="cat-chip" data-due="7">+7 days</button><button type="button" class="cat-chip" data-due="15">+15 days</button><button type="button" class="cat-chip" data-due="30">+30 days</button></div>`}
+        </div>
+
+        <div class="save-bar" id="saveBar">
+          <div><div class="doc-label" style="margin:0">Total</div><div class="save-total" id="saveTotal">${escapeHtml(cur)} 0</div></div>
+          <button type="submit" class="btn btn-primary" id="createInvoiceBtn" disabled>${isPur ? 'Save Purchase' : isRet ? 'Save Return' : (isEst ? 'Save Quotation' : 'Save Invoice')}</button>
+        </div>
       </form>
     </div>`;
   }
 
   function bindCreateInvoice() {
-    const qtyMap = {};
-    window._invoiceQtyMap = qtyMap;
-
-    function update() {
-      let total = 0, has = false;
-      Object.entries(qtyMap).forEach(([id, qty]) => {
-        if (qty > 0) {
-          has = true;
-          const p = products.find(x => x.id === id);
-          if (p) total += p.price * qty;
-        }
-      });
-      const sum = $('#invoiceSummary'), tot = $('#invoiceTotal'), btn = $('#createInvoiceBtn');
-      if (sum) sum.style.display = has ? 'block' : 'none';
-      if (tot) tot.textContent = `${settings.currency} ${money(total)}`;
-      if (btn) btn.disabled = !has;
+    const cur = settings.currency;
+    const isRet = docCtx.type === 'return';
+    const isEst = docCtx.type === 'estimate';
+    const isPur = docCtx.type === 'purchase';
+    const ref = docCtx.ref || null;
+    const from = docCtx.from || null;          // quotation being converted to an invoice
+    docCtx = {};                              // consumed: next visit starts a normal invoice
+    const lines = [];                         // { productId, name, price, cost, qty }
+    const st = { discType: 'amt', mode: 'Cash' };
+    // most units of a product this document may contain
+    const refQty = {};
+    if (isRet && ref) {
+      const done = returnedQty(ref.id);
+      (ref.items || []).forEach(it => { refQty[it.productId] = (refQty[it.productId] || 0) + it.qty; });
+      Object.keys(refQty).forEach(k => { refQty[k] = Math.max(0, refQty[k] - (done[k] || 0)); });
     }
-    window._invoiceUpdate = update;
+    const capOf = p => (isEst || isPur) ? Infinity : (!isRet ? p.stock : (ref ? (refQty[p.id] || 0) : Infinity));
+    window._docIsReturn = isRet;
+    window._docLines = lines;
 
-    function setQty(id, q) {
+    const val = id => { const el = document.getElementById(id); return el ? el.value : ''; };
+    function opts() {
+      return { discType: st.discType, discValue: val('discIn'), taxRate: val('taxIn'),
+               charges: val('chIn'), roundOff: !!document.getElementById('roundIn')?.checked };
+    }
+    function recalc(fromPaid) {
+      const c = calcDoc(lines, opts());
+      const has = lines.length > 0;
+      const q = id => document.getElementById(id);
+      if (q('docTotals')) q('docTotals').style.display = has ? '' : 'none';
+      if (q('docPay')) q('docPay').style.display = (has && !isEst) ? '' : 'none';
+      if (q('tSub')) q('tSub').textContent = `${cur} ${money(c.sub)}`;
+      if (q('tTotal')) q('tTotal').textContent = `${cur} ${money(c.total)}`;
+      if (q('saveTotal')) q('saveTotal').textContent = `${cur} ${money(c.total)}`;
+      if (q('createInvoiceBtn')) q('createInvoiceBtn').disabled = !has;
+      if (q('paidFull') && q('paidFull').checked && q('paidIn')) q('paidIn').value = c.total || '';
+      const paid = Math.min(parseFloat(val('paidIn')) || 0, c.total);
+      if (q('tDue')) { q('tDue').textContent = `${cur} ${money(Math.max(0, round2(c.total - paid)))}`; }
+      return c;
+    }
+    function renderLines() {
+      const box = document.getElementById('docLines');
+      if (!box) return;
+      if (!lines.length) {
+        box.innerHTML = `<div class="doc-empty">No items yet. Tap <b>+ Add Items</b> to pick products.</div>`;
+      } else {
+        box.innerHTML = lines.map((l, i) => `
+          <div class="line-card" data-i="${i}">
+            <div class="line-top"><span class="line-name">${escapeHtml(l.name)}</span>
+              <button type="button" class="line-x" data-del="${i}" aria-label="Remove">✕</button></div>
+            <div class="line-grid">
+              <div class="qty-control"><button type="button" class="qty-btn" data-q="-1" data-i="${i}">−</button><span class="qty-value">${l.qty}</span><button type="button" class="qty-btn" data-q="1" data-i="${i}">+</button></div>
+              <div class="line-rate"><span>×</span><input type="number" inputmode="decimal" min="0" step="any" data-rate="${i}" value="${l.price}"${isStaff() ? ' readonly' : ''} /></div>
+              <div class="line-amt" id="la-${i}">${cur} ${money(l.price * l.qty)}</div>
+            </div>
+          </div>`).join('');
+      }
+      recalc();
+    }
+    function addProduct(id, n) {
       const p = products.find(x => x.id === id);
-      if (!p) return;
-      if (q < 0) q = 0;
-      if (q > p.stock) { toast('Not enough stock'); q = p.stock; }
-      qtyMap[id] = q;
-      const el = document.getElementById('qty-' + id);
-      if (el) el.textContent = q;
-      update();
+      if (!p) return false;
+      let l = lines.find(x => x.productId === id);
+      const next = (l ? l.qty : 0) + (n || 1);
+      if (next > capOf(p)) { toast(isRet ? 'More than was sold on that invoice' : 'Not enough stock'); return false; }
+      if (l) l.qty = next; else lines.push({ productId: p.id, name: p.name, price: isPur ? (p.cost || 0) : p.price, cost: p.cost || 0, qty: next });
+      renderLines();
+      return true;
     }
-    window._invoiceSetQty = setQty;
+    window._docAdd = addProduct;
 
-    document.querySelectorAll('#invoiceProducts .qty-btn').forEach(btn => {
-      btn.addEventListener('click', (e) => {
-        e.preventDefault();
-        e.stopPropagation();
-        const id = btn.dataset.id;
-        const delta = parseInt(btn.dataset.qty, 10);
-        setQty(id, (qtyMap[id] || 0) + delta);
-      });
+    const linesBox = document.getElementById('docLines');
+    linesBox.addEventListener('click', e => {
+      const q = e.target.closest('[data-q]'), d = e.target.closest('[data-del]');
+      if (q) {
+        const l = lines[+q.dataset.i]; if (!l) return;
+        const p = products.find(x => x.id === l.productId);
+        const n = l.qty + (+q.dataset.q);
+        if (n < 1) { lines.splice(+q.dataset.i, 1); }
+        else if (p && n > capOf(p)) { toast(isRet ? 'More than was sold on that invoice' : 'Not enough stock'); return; }
+        else l.qty = n;
+        renderLines();
+      } else if (d) { lines.splice(+d.dataset.del, 1); renderLines(); }
+    });
+    linesBox.addEventListener('input', e => {
+      const r = e.target.closest('[data-rate]'); if (!r) return;
+      const l = lines[+r.dataset.rate]; if (!l) return;
+      l.price = Math.max(0, parseFloat(r.value) || 0);
+      const a = document.getElementById('la-' + r.dataset.rate);
+      if (a) a.textContent = `${cur} ${money(l.price * l.qty)}`;
+      recalc();
     });
 
-    // Payment chips
-    document.querySelectorAll('.pay-chip').forEach(chip => {
-      chip.addEventListener('click', (e) => {
-        e.preventDefault();
-        document.querySelectorAll('.pay-chip').forEach(c => c.classList.remove('active'));
-        chip.classList.add('active');
-        const val = chip.dataset.pay;
-        const hidden = $('#paymentStatusInput');
-        if (hidden) hidden.value = val;
-        const grp = $('#paidAmountGroup');
-        if (grp) grp.style.display = val === 'partial' ? 'block' : 'none';
-        if (val === 'paid') {
-          // will set full amount on submit
-        }
+    ['discIn', 'taxIn', 'chIn', 'roundIn', 'paidIn'].forEach(id => {
+      const el = document.getElementById(id);
+      if (!el) return;
+      el.addEventListener(id === 'roundIn' ? 'change' : 'input', () => {
+        if (id === 'paidIn') { const f = document.getElementById('paidFull'); if (f) f.checked = false; }
+        recalc();
       });
     });
+    document.getElementById('paidFull').addEventListener('change', () => {
+      const f = document.getElementById('paidFull');
+      if (!f.checked) document.getElementById('paidIn').value = '';
+      recalc();
+    });
+    document.querySelectorAll('#discSeg button').forEach(b => b.addEventListener('click', () => {
+      st.discType = b.dataset.dt;
+      document.querySelectorAll('#discSeg button').forEach(x => x.classList.toggle('on', x === b));
+      recalc();
+    }));
+    document.querySelectorAll('[data-due]').forEach(b => b.addEventListener('click', () => {
+      const d = new Date(); d.setDate(d.getDate() + (+b.dataset.due));
+      const el = document.getElementById('dueIn'); if (el) el.value = d.toISOString().slice(0, 10);
+    }));
+    document.querySelectorAll('#modeRow .cat-chip').forEach(b => b.addEventListener('click', () => {
+      st.mode = b.dataset.mode;
+      document.querySelectorAll('#modeRow .cat-chip').forEach(x => x.classList.toggle('active', x === b));
+    }));
 
-    // Product search on invoice
-    const pSearch = $('#invoiceProductSearch');
-    if (pSearch) {
-      pSearch.addEventListener('input', () => {
-        const q = pSearch.value.trim().toLowerCase();
-        document.querySelectorAll('.invoice-product-row').forEach(row => {
-          const name = row.dataset.name || '';
-          const barcode = row.dataset.barcode || '';
-          row.style.display = (!q || name.includes(q) || barcode.includes(q)) ? '' : 'none';
-        });
+    if (isStaff()) ['discIn', 'taxIn', 'chIn', 'chLabel', 'roundIn'].forEach(id => { const el = document.getElementById(id); if (el) el.disabled = true; });
+    document.getElementById('addItemsBtn').addEventListener('click', () => openItemPicker(lines, addProduct, (isEst || isPur) ? (() => true) : isRet ? (ref ? (p => (refQty[p.id] || 0) > 0) : (() => true)) : null));
+    // prefill from the invoice being returned
+    if (isRet && ref) {
+      (ref.items || []).forEach(it => {
+        const left = refQty[it.productId] || 0;
+        if (left > 0 && products.some(p => p.id === it.productId)) lines.push({ productId: it.productId, name: it.name, price: it.price, cost: it.cost || 0, qty: left });
       });
+      const sel = document.querySelector('[name="customerId"]'); if (sel && ref.customerId) { sel.value = ref.customerId; }
+      const nm = document.getElementById('customerNameInput'); if (nm && ref.customerName && ref.customerName !== 'Walk-in Customer') nm.value = ref.customerName;
+      const ph = document.getElementById('customerPhoneInput'); if (ph) ph.value = ref.customerPhone || '';
+      if (!lines.length) toast('Everything on that invoice was already returned');
     }
-
-    // Barcode enter key
-    const bcInput = $('#invoiceBarcodeInput');
-    if (bcInput) {
-      bcInput.addEventListener('keydown', (e) => {
-        if (e.key === 'Enter') {
-          e.preventDefault();
-          addProductByBarcode(bcInput.value.trim());
-          bcInput.value = '';
-        }
+    // prefill from the quotation being converted
+    if (from) {
+      const m = from.meta || {};
+      (from.items || []).forEach(it => {
+        const p = products.find(x => x.id === it.productId);
+        if (!p) return;
+        const q = Math.min(it.qty, p.stock);
+        if (q > 0) lines.push({ productId: it.productId, name: it.name, price: it.price, cost: p.cost || it.cost || 0, qty: q });
+        if (q < it.qty) toast(`${it.name}: only ${p.stock} in stock`, 3500);
       });
+      const sel = document.querySelector('[name="customerId"]'); if (sel && from.customerId) sel.value = from.customerId;
+      const nm = document.getElementById('customerNameInput'); if (nm && from.customerName && from.customerName !== 'Walk-in Customer') nm.value = from.customerName;
+      const ph = document.getElementById('customerPhoneInput'); if (ph) ph.value = from.customerPhone || '';
+      if (m.discValue) { document.getElementById('discIn').value = m.discValue; st.discType = m.discType || 'amt';
+        document.querySelectorAll('#discSeg button').forEach(x => x.classList.toggle('on', x.dataset.dt === st.discType)); }
+      if (m.charges) { document.getElementById('chIn').value = m.charges; document.getElementById('chLabel').value = m.chargeLabel || ''; }
+      if (m.roundOff) document.getElementById('roundIn').checked = true;
     }
+    renderLines();
 
     let submitting = false;
     $('#invoiceForm').addEventListener('submit', e => {
       e.preventDefault();
-      if (submitting) return;                       // double-tap guard
-      if (typeof enforceLimit === 'function' && !enforceLimit('invoices', invoices.length)) return;
+      if (submitting) return;
+      if (!isPur && typeof enforceLimit === 'function' && !enforceLimit('invoices', invoices.length)) return;
       const fd = new FormData(e.target);
 
-      // 1) Validate everything WITHOUT touching stock or counters
-      const items = [];
+      // 1) Validate WITHOUT touching stock or counters
+      if (!lines.length) { toast('Add at least one item'); return; }
       const short = [];
-      let total = 0;
-      Object.entries(qtyMap).forEach(([id, qty]) => {
-        if (!(qty > 0)) return;
-        const p = products.find(x => x.id === id);
-        if (!p) return;
-        if (p.stock < qty) { short.push(`${p.name} (only ${p.stock} left)`); return; }
-        items.push({ productId: p.id, name: p.name, price: p.price, cost: p.cost || 0, qty });
-        total += p.price * qty;
+      if (!isRet && !isEst && !isPur) lines.forEach(l => {
+        const p = products.find(x => x.id === l.productId);
+        if (!p || p.stock < l.qty) short.push(`${l.name} (only ${p ? p.stock : 0} left)`);
       });
       if (short.length) { toast('Not enough stock: ' + short.join(', '), 4000); return; }
-      if (!items.length) { toast('Select at least one product'); return; }
-      total = round2(total);
+      const o = opts();
+      const c = calcDoc(lines, o);
+      if (c.total <= 0 && lines.some(l => l.price > 0)) { toast('Discount cannot be more than the bill'); return; }
+      let paidAmount = isEst ? 0 : round2(Math.min(Math.max(parseFloat(fd.get('paidAmount')) || 0, 0), c.total));
+      const paymentStatus = paidAmount >= c.total && c.total > 0 ? 'paid' : (paidAmount > 0 ? 'partial' : 'unpaid');
 
-      let paymentStatus = (fd.get('paymentStatus') || $('#paymentStatusInput')?.value || 'unpaid');
-      let paidAmount = round2(parseFloat(fd.get('paidAmount')) || 0);
-      if (paymentStatus === 'paid') paidAmount = total;
-      if (paymentStatus === 'unpaid') paidAmount = 0;
-      if (paidAmount > total) paidAmount = total;
-      if (paymentStatus === 'partial' && paidAmount <= 0) {
-        toast('Enter advance amount');
+      if (isPur) {
+        submitting = true;
+        const nowP = new Date().toISOString();
+        const pk = fd.get('docDate');
+        const pDate = (pk && pk !== nowP.slice(0, 10)) ? new Date(pk + 'T12:00:00').toISOString() : nowP;
+        const pnum = nextPurNumber();
+        let sid = fd.get('customerId') || '', sname = (fd.get('customerName') || '').trim(), sphone = (fd.get('customerPhone') || '').trim();
+        if (sid) { const sp = suppliers.find(x => x.id === sid); if (sp) { if (!sname) sname = sp.name; if (!sphone) sphone = sp.phone || ''; } }
+        if (!sname) { submitting = false; toast('Choose or type the supplier'); return; }
+        if (!sid) {
+          let sp = suppliers.find(x => x.name.toLowerCase() === sname.toLowerCase());
+          if (!sp) {
+            if (typeof enforceLimit === 'function' && !enforceLimit('suppliers', suppliers.length)) { submitting = false; return; }
+            sp = { id: uid(), name: sname, phone: sphone, notes: '' }; suppliers.push(sp);
+          } else if (sphone && !sp.phone) sp.phone = sphone;
+          sid = sp.id; sname = sp.name; sphone = sp.phone || sphone;
+        }
+        const pitems = lines.map(l => ({ productId: l.productId, name: l.name, price: l.price, qty: l.qty }));
+        pitems.forEach(it => {
+          const pr = products.find(x => x.id === it.productId);
+          if (pr) { pr.stock += it.qty; if (it.price > 0) pr.cost = it.price; }
+          stockMovements.unshift({ id: uid(), productId: it.productId, productName: it.name, type: 'in', qty: it.qty, date: nowP, note: `Purchase ${pnum}` });
+        });
+        const pmeta = { subtotal: c.sub, discount: c.discount, discType: o.discType, discValue: Number(o.discValue) || 0,
+          taxName: 'Tax', taxRate: c.taxRate, tax: c.tax, chargeLabel: (document.getElementById('chLabel')?.value || '').trim(), charges: c.charges,
+          roundOff: c.roundOff, paymentMode: paidAmount > 0 ? st.mode : '' };
+        const bn = (fd.get('billNo') || '').trim(); if (bn) pmeta.billNo = bn;
+        const dd = fd.get('dueDate'); if (dd && paymentStatus !== 'paid') pmeta.dueDate = dd;
+        const pur = { id: uid(), number: pnum, supplierId: sid, supplierName: sname, supplierPhone: sphone, items: pitems, total: c.total, paymentStatus, paidAmount, meta: pmeta, date: pDate };
+        purchases.unshift(pur);
+        persist();
+        toast('Purchase saved. Stock added.');
+        setView('purchases');
+        openPurchaseDetail(pur);
         return;
-      }
-      if (paymentStatus === 'partial' && paidAmount >= total) {
-        paymentStatus = 'paid';
-        paidAmount = total;
       }
 
       // 2) Commit
       submitting = true;
       const nowIso = new Date().toISOString();
-      const invNumber = `${settings.invoicePrefix || 'INV'}-${invoiceCounter++}`;
-      items.forEach(it => {
+      const pick = fd.get('docDate');
+      const dateIso = (pick && pick !== nowIso.slice(0, 10)) ? new Date(pick + 'T12:00:00').toISOString() : nowIso;
+      const invNumber = isRet ? nextDocNumber('CN') : isEst ? nextDocNumber('QT') : `${settings.invoicePrefix || 'INV'}-${invoiceCounter++}`;
+      const items = lines.map(l => ({ productId: l.productId, name: l.name, price: l.price, cost: l.cost, qty: l.qty }));
+      if (!isEst) items.forEach(it => {
         const p = products.find(x => x.id === it.productId);
-        if (p) p.stock -= it.qty;
-        stockMovements.unshift({
-          id: uid(),
-          productId: it.productId,
-          productName: it.name,
-          type: 'out',
-          qty: it.qty,
-          date: nowIso,
-          note: `Invoice ${invNumber}`
-        });
+        if (p) p.stock += (isRet ? it.qty : -it.qty);
+        stockMovements.unshift({ id: uid(), productId: it.productId, productName: it.name, type: isRet ? 'in' : 'out', qty: it.qty, date: nowIso, note: `${isRet ? 'Return' : 'Invoice'} ${invNumber}` });
       });
 
       let customerId = fd.get('customerId') || '';
       let customerName = (fd.get('customerName') || '').trim();
       let customerPhone = (fd.get('customerPhone') || '').trim();
       if (customerId) {
-        const c = customers.find(x => x.id === customerId);
-        if (c) {
-          if (!customerName) customerName = c.name;
-          if (!customerPhone) customerPhone = c.phone || '';
-        }
+        const cu = customers.find(x => x.id === customerId);
+        if (cu) { if (!customerName) customerName = cu.name; if (!customerPhone) customerPhone = cu.phone || ''; }
       }
       if (!customerName) { customerName = 'Walk-in Customer'; customerId = ''; }
-
-      // Always attach to one customer account when not walk-in
       if (customerName !== 'Walk-in Customer') {
-        const c = findOrCreateCustomer(customerName, customerPhone);
-        if (c) {
-          customerId = c.id;
-          customerName = c.name;
-          if (!customerPhone) customerPhone = c.phone || '';
-        }
+        const cu = findOrCreateCustomer(customerName, customerPhone);
+        if (cu) { customerId = cu.id; customerName = cu.name; if (!customerPhone) customerPhone = cu.phone || ''; }
       }
 
+      const meta = {
+        subtotal: c.sub, discount: c.discount, discType: o.discType, discValue: Number(o.discValue) || 0,
+        taxName: 'Tax', taxRate: c.taxRate, tax: c.tax,
+        chargeLabel: (document.getElementById('chLabel')?.value || '').trim(), charges: c.charges,
+        roundOff: c.roundOff, paymentMode: paidAmount > 0 ? st.mode : ''
+      };
+      if (isRet && ref) { meta.refId = ref.id; meta.refNumber = ref.number; }
+      if (isEst) { const vu = fd.get('validUntil'); if (vu) meta.validUntil = vu; }
+      if (isStaff()) meta.by = 'Staff';
+      { const dd = fd.get('dueDate'); if (dd && !isRet && !isEst && paymentStatus !== 'paid') meta.dueDate = dd; }
+      if (from) { meta.fromId = from.id; meta.fromNumber = from.number; }
       const inv = {
-        id: uid(),
-        number: invNumber,
-        customerId: customerId || null,
-        customerName,
-        customerPhone,
-        items, total,
-        paymentStatus,
-        paidAmount,
-        date: nowIso
+        id: uid(), number: invNumber, docType: isRet ? 'return' : (isEst ? 'estimate' : 'sale'),
+        customerId: customerId || null, customerName, customerPhone,
+        items, total: c.total, paymentStatus, paidAmount, meta, date: dateIso
       };
       invoices.unshift(inv);
       persist();
-      toast(paymentStatus === 'paid' ? 'Invoice created (Paid)' : paymentStatus === 'partial' ? 'Invoice created (Advance recorded)' : 'Invoice created (Unpaid)');
-      setView('invoices');          // leaves the filled form behind so it can't be re-submitted
+      if (isRet) { toast('Return saved. Stock added back.'); setView('invoices'); openInvoiceDetail(inv); return; }
+      if (isEst) { toast('Quotation saved'); invFilter = 'estimate'; setView('invoices'); openInvoiceDetail(inv); return; }
+      if (from) { const q = invoices.find(x => x.id === from.id); if (q) { q.meta = Object.assign({}, q.meta, { convertedTo: inv.number, convertedId: inv.id }); q.updatedAt = new Date().toISOString(); persist(); } }
+      toast(paymentStatus === 'paid' ? 'Invoice saved (Paid)' : paymentStatus === 'partial' ? 'Invoice saved (Advance recorded)' : 'Invoice saved (Unpaid)');
+      setView('invoices');
       openInvoiceDetail(inv);
+    });
+  }
+
+  // Product picker sheet: search + tap to add (count badge shows what is already on the bill)
+  function openItemPicker(lines, addProduct, allow) {
+    const cur = settings.currency;
+    function rows(q) {
+      q = (q || '').trim().toLowerCase();
+      const list = products.filter(p => !q || p.name.toLowerCase().includes(q) || (p.barcode || '').toLowerCase().includes(q));
+      if (!list.length) return '<div class="doc-empty">No products found</div>';
+      return list.map(p => {
+        const n = (lines.find(l => l.productId === p.id) || {}).qty || 0;
+        const out = allow ? !allow(p) : p.stock <= 0;
+        return `<div class="pick-row${out ? ' out' : ''}" data-pid="${p.id}">
+          <div style="flex:1;min-width:0"><div class="font-semibold">${escapeHtml(p.name)}</div>
+            <div class="text-sm text-secondary">${cur} ${money(p.price)} · ${out ? (allow ? 'Not on that invoice' : 'Out of stock') : 'Stock: ' + p.stock}</div></div>
+          ${n ? `<span class="pick-badge">${n}</span>` : ''}
+          <span class="pick-add">${out ? '' : '+'}</span></div>`;
+      }).join('');
+    }
+    $('#modalRoot').innerHTML = `
+      <div class="modal-overlay" id="pickOverlay">
+        <div class="modal-sheet">
+          <div class="modal-handle"></div>
+          <div class="modal-header"><h3 class="modal-title">Add Items</h3>
+            <button class="modal-close" data-action="close-modal"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button></div>
+          <div class="search-wrap mb-8"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+            <input type="search" class="search-input" id="pickSearch" placeholder="Search name or barcode" /></div>
+          <div id="pickList" class="pick-list">${rows('')}</div>
+          <button type="button" class="btn btn-primary btn-block mt-12" data-action="close-modal">Done</button>
+        </div>
+      </div>`;
+    const list = document.getElementById('pickList'), s = document.getElementById('pickSearch');
+    s.addEventListener('input', () => { list.innerHTML = rows(s.value); });
+    list.addEventListener('click', e => {
+      const r = e.target.closest('[data-pid]'); if (!r || r.classList.contains('out')) return;
+      if (addProduct(r.dataset.pid, 1)) list.innerHTML = rows(s.value);
     });
   }
 
@@ -790,12 +1597,8 @@
     const p = products.find(x => (x.barcode || '').toLowerCase() === code.toLowerCase());
     if (!p) { toast('Product not found for barcode'); return; }
     if (p.stock <= 0) { toast('Out of stock'); return; }
-    const qtyMap = window._invoiceQtyMap || {};
-    const cur = qtyMap[p.id] || 0;
-    if (cur >= p.stock) { toast('Not enough stock'); return; }
-    if (window._invoiceSetQty) window._invoiceSetQty(p.id, cur + 1);
+    if (window._docAdd && document.getElementById('docLines')) { if (window._docAdd(p.id, 1)) toast('+1 ' + p.name); }
     else toast('Open New Invoice first');
-    toast('+1 ' + p.name);
   }
 
   function viewCustomers() {
@@ -846,7 +1649,7 @@
           <div class="text-sm text-secondary mb-8">${escapeHtml(cust.phone || '')}${cust.address ? ' · ' + escapeHtml(cust.address) : ''}</div>
           <div class="stats-grid mb-16">
             <div class="stat-card"><div class="stat-label">Total Sales</div><div class="stat-value primary">${settings.currency} ${money(bal.total)}</div></div>
-            <div class="stat-card"><div class="stat-label">Due / Credit</div><div class="stat-value ${bal.due > 0 ? 'danger' : 'success'}">${settings.currency} ${money(bal.due)}</div></div>
+            <div class="stat-card"><div class="stat-label">${bal.credit > 0 ? 'Credit (we owe)' : 'Due'}</div><div class="stat-value ${bal.due > 0 ? 'danger' : 'success'}">${settings.currency} ${money(bal.credit > 0 ? bal.credit : bal.due)}</div></div>
           </div>
           <div class="section-header"><h2 class="section-title">Invoice history</h2></div>
           ${custInvoices.length === 0 ? '<div class="text-secondary text-sm">No invoices yet</div>' :
@@ -855,16 +1658,21 @@
               const st = due <= 0 ? 'Paid' : (inv.paidAmount > 0 ? 'Partial' : 'Unpaid');
               return `<div class="list-item" data-action="view-invoice" data-id="${inv.id}">
                 <div class="list-item-body">
-                  <div class="list-item-title">${escapeHtml(inv.number)}</div>
+                  <div class="list-item-title">${inv.docType === 'return' ? 'Return ' : ''}${escapeHtml(inv.number)}</div>
                   <div class="list-item-sub">${formatDate(inv.date)} · ${st}</div>
                 </div>
                 <div class="list-item-right">
-                  <div class="list-item-price">${settings.currency} ${money(inv.total)}</div>
+                  <div class="list-item-price"${inv.docType === 'return' ? ' style="color:var(--danger)"' : ''}>${inv.docType === 'return' ? '−' : ''}${settings.currency} ${money(inv.total)}</div>
                   ${due > 0 ? `<span class="list-item-badge badge-out">Due ${money(due)}</span>` : `<span class="list-item-badge badge-ok">Paid</span>`}
                 </div>
               </div>`;
             }).join('')}</div>`}
-          <div class="flex gap-12 mt-20">
+          <div class="flex gap-8 mt-16" style="flex-wrap:wrap">
+            ${bal.due > 0 ? `<button class="btn btn-primary" style="flex:1" data-action="receive-payment" data-id="${cust.id}">Receive</button>` : ''}
+            <button class="btn btn-secondary" style="flex:1" data-action="open-statement" data-id="${cust.id}">Statement</button>
+            ${bal.due > 0 ? `<button class="btn btn-secondary" style="flex:1" data-action="remind-customer" data-id="${cust.id}">Remind</button>` : ''}
+          </div>
+          <div class="flex gap-12 mt-12">
             <button class="btn btn-secondary btn-block" data-action="edit-customer" data-id="${cust.id}">Edit</button>
           </div>
         </div>
@@ -879,29 +1687,29 @@
     }
     const sorted = [...suppliers].sort((a,b) => a.name.localeCompare(b.name));
     return `<div class="fade-in"><div class="list">${sorted.map(s => `
-      <div class="list-item" data-action="edit-supplier" data-id="${s.id}">
+      <div class="list-item" data-action="view-supplier" data-id="${s.id}">
         <div class="list-item-icon">${initials(s.name)}</div>
         <div class="list-item-body">
           <div class="list-item-title">${escapeHtml(s.name)}</div>
           <div class="list-item-sub">${escapeHtml(s.phone || 'No phone')}</div>
+          ${(() => { const b = supplierBalance(s); return b.due > 0 ? `<span class="list-item-badge badge-out">You owe ${settings.currency} ${money(b.due)}</span>` : (b.total > 0 ? '<span class="list-item-badge badge-ok">Clear</span>' : ''); })()}
         </div>
       </div>`).join('')}</div></div>`;
   }
 
   // ---------- Reports ----------
   function viewReports() {
-    const revenue = invoices.reduce((s, i) => s + (i.total || 0), 0);
-    const cogs = invoices.reduce((s, inv) => s + inv.items.reduce((a, it) => a + ((it.cost || 0) * it.qty), 0), 0);
+    const { revenue, cogs } = netTotals();
     const totalExpenses = expenses.reduce((s, e) => s + (e.amount || 0), 0);
     const profit = revenue - cogs - totalExpenses;
-    const totalInvoices = invoices.length;
+    const totalInvoices = invoices.filter(i => docSign(i) > 0).length;
     const avgTicket = totalInvoices ? revenue / totalInvoices : 0;
 
     const sold = {};
-    invoices.forEach(inv => inv.items.forEach(it => {
-      sold[it.name] = (sold[it.name] || 0) + it.qty;
-    }));
-    const top = Object.entries(sold).sort((a,b) => b[1] - a[1]).slice(0, 5);
+    invoices.forEach(inv => { const g = docSign(inv); if (g) inv.items.forEach(it => {
+      sold[it.name] = (sold[it.name] || 0) + g * it.qty;
+    }); });
+    const top = Object.entries(sold).filter(e => e[1] > 0).sort((a,b) => b[1] - a[1]).slice(0, 5);
 
     // Expense by category
     const byCat = {};
@@ -987,6 +1795,7 @@
   }
 
   function viewMore() {
+    if (isStaff()) return staffMoreHTML();
     return `<div class="fade-in">
       <div class="card mb-16">
         <div class="text-sm text-secondary">Business</div>
@@ -997,6 +1806,16 @@
         <button class="menu-item" data-view="customers">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
           Customers
+          <svg class="menu-item-arrow" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="9 18 15 12 9 6"/></svg>
+        </button>
+        <button class="menu-item" data-view="daybook">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg>
+          Day Book &amp; Cash Flow
+          <svg class="menu-item-arrow" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="9 18 15 12 9 6"/></svg>
+        </button>
+        <button class="menu-item" data-view="purchases">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="9" cy="21" r="1"/><circle cx="20" cy="21" r="1"/><path d="M1 1h4l2.7 13.4a2 2 0 0 0 2 1.6h9.7a2 2 0 0 0 2-1.6L23 6H6"/></svg>
+          Purchases
           <svg class="menu-item-arrow" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="9 18 15 12 9 6"/></svg>
         </button>
         <button class="menu-item" data-view="suppliers">
@@ -1034,6 +1853,7 @@
           Shopify store <span style="font-size:10px;background:var(--primary);color:#fff;border-radius:6px;padding:1px 6px;margin-left:6px">PRO</span>
           <svg class="menu-item-arrow" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="9 18 15 12 9 6"/></svg>
         </button>
+        ${lockEnabled() ? `<button class="menu-item" data-action="lock-now"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>Lock app<svg class="menu-item-arrow" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="9 18 15 12 9 6"/></svg></button>` : ''}
         <button class="menu-item" data-action="sign-out-user">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
           Sign out
@@ -1413,9 +2233,15 @@
               ], settings.currency || 'PKR')}
             </div>
             <div class="form-group">
+              <label class="form-label">Default Tax % (added to new invoices, 0 = none)</label>
+              <input class="form-input" name="taxRate" type="number" inputmode="decimal" min="0" step="any" value="${settings.taxRate || ''}" placeholder="0" />
+            </div>
+            <div class="form-group">
               <label class="form-label">Invoice Prefix</label>
               <input class="form-input" name="invoicePrefix" value="${escapeHtml(settings.invoicePrefix || 'INV')}" />
             </div>
+            ${themePickerHTML()}
+            ${securityHTML()}
             <button type="submit" class="btn btn-primary btn-block mt-16">Save Settings</button>
           </form>
         </div>
@@ -1432,6 +2258,7 @@
       settings.taxId = fd.get('taxId').trim();
       settings.currency = fd.get('currency');
       settings.invoicePrefix = fd.get('invoicePrefix').trim() || 'INV';
+      settings.taxRate = Math.max(0, parseFloat(fd.get('taxRate')) || 0);
       settings.paymentNote = (fd.get('paymentNote') || '').trim() || 'Pay via JazzCash / EasyPaisa / Bank';
       // logo / paymentQr updated live via pick/remove actions
       persist();
@@ -1450,36 +2277,46 @@
     let statusLabel = 'Unpaid';
     if (paid >= inv.total) statusLabel = 'Fully Paid';
     else if (paid > 0) statusLabel = 'Partial / Advance';
+    const isEst = inv.docType === 'estimate';
+    if (isEst) statusLabel = inv.meta && inv.meta.convertedTo ? 'Converted to ' + inv.meta.convertedTo : 'Open';
+    if (inv.docType === 'return') statusLabel = paid >= inv.total ? 'Fully Refunded' : (paid > 0 ? 'Partly Refunded' : 'Credit pending');
 
     $('#modalRoot').innerHTML = `
       <div class="modal-overlay" id="invDetail">
         <div class="modal-sheet">
           <div class="modal-handle"></div>
           <div class="modal-header">
-            <h3 class="modal-title">Invoice ${escapeHtml(inv.number)}</h3>
+            <h3 class="modal-title">${docWord(inv)} ${escapeHtml(inv.number)}</h3>
             <button class="modal-close" data-action="close-modal"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button>
           </div>
           <div class="mb-16">
             <div class="text-sm text-secondary">Customer</div>
             <div class="font-semibold">${escapeHtml(inv.customerName || 'Walk-in')}</div>
             ${inv.customerPhone ? `<div class="text-sm text-secondary mt-8">${escapeHtml(inv.customerPhone)}</div>` : ''}
-            <div class="text-sm text-secondary mt-8">${formatDate(inv.date)}</div>
+            <div class="text-sm text-secondary mt-8">${formatDate(inv.date)}${inv.meta && inv.meta.refNumber ? ' · against ' + escapeHtml(inv.meta.refNumber) : ''}${inv.meta && inv.meta.by ? ' · by ' + escapeHtml(inv.meta.by) : ''}</div>
           </div>
           <div class="invoice-summary">${itemsHtml}
+            ${(() => { const x = invExtraRows(inv); return x.rows.length ? `<div class="summary-row"><span>Subtotal</span><span>${settings.currency} ${money(x.sub)}</span></div>` + x.rows.map(r => `<div class="summary-row"><span>${escapeHtml(r.label)}</span><span>${r.amt < 0 ? '−' : ''}${settings.currency} ${money(Math.abs(r.amt))}</span></div>`).join('') : ''; })()}
             <div class="summary-row total"><span>Total</span><span>${settings.currency} ${money(inv.total)}</span></div>
-            <div class="summary-row"><span>Paid</span><span style="color:var(--success)">${settings.currency} ${money(paid)}</span></div>
-            <div class="summary-row"><span>Due</span><span style="color:${due > 0 ? 'var(--danger)' : 'var(--success)'}">${settings.currency} ${money(due)}</span></div>
+            ${inv.meta && inv.meta.paymentMode ? `<div class="summary-row"><span>Payment mode</span><span>${escapeHtml(inv.meta.paymentMode)}</span></div>` : ''}
+            ${inv.meta && inv.meta.dueDate ? `<div class="summary-row"><span>Due date</span><span${isOverdue(inv) ? ' style="color:var(--danger);font-weight:600"' : ''}>${formatDate(inv.meta.dueDate)}${isOverdue(inv) ? ' · overdue' : ''}</span></div>` : ''}
+            ${inv.meta && inv.meta.validUntil ? `<div class="summary-row"><span>Valid until</span><span>${formatDate(inv.meta.validUntil)}</span></div>` : ''}
+            ${isEst ? '' : `<div class="summary-row"><span>${inv.docType === 'return' ? 'Refunded' : 'Paid'}</span><span style="color:var(--success)">${settings.currency} ${money(paid)}</span></div>
+            <div class="summary-row"><span>${inv.docType === 'return' ? 'Credit left' : 'Due'}</span><span style="color:${due > 0 ? 'var(--danger)' : 'var(--success)'}">${settings.currency} ${money(due)}</span></div>
+`}
             <div class="summary-row"><span>Status</span><span class="font-semibold">${statusLabel}</span></div>
           </div>
-          ${due > 0 ? `
+          ${isEst && !(inv.meta && inv.meta.convertedTo) ? `<button class="btn btn-primary btn-block mt-16" data-action="convert-estimate" data-id="${inv.id}">Convert to Invoice</button>` : ''}
+          ${(!isEst && due > 0) ? `
           <div class="form-group mt-16">
-            <label class="form-label">Record payment</label>
+            <label class="form-label">${inv.docType === 'return' ? 'Record refund paid' : 'Record payment'}</label>
             <div class="input-with-btn">
               <input type="number" class="form-input" id="recordPayInput" min="0" step="0.01" placeholder="Amount" />
               <button type="button" class="btn btn-primary btn-sm" style="height:48px" data-action="record-payment" data-id="${inv.id}">Add</button>
             </div>
+            ${modeChips('rpMode')}
           </div>
-          <button class="btn btn-secondary btn-block mt-8" data-action="mark-paid" data-id="${inv.id}">Mark as Fully Paid</button>
+          <button class="btn btn-secondary btn-block mt-8" data-action="mark-paid" data-id="${inv.id}">${inv.docType === 'return' ? 'Mark as Fully Refunded' : 'Mark as Fully Paid'}</button>
           ` : ''}
           <div class="flex gap-8 mt-20" style="flex-wrap:wrap">
             <button class="btn btn-secondary" style="flex:1" data-action="share-image" data-id="${inv.id}">
@@ -1496,6 +2333,8 @@
             </button>
           </div>
           <button class="btn btn-ghost btn-block mt-12" data-action="share-whatsapp-text" data-id="${inv.id}">Share as WhatsApp text</button>
+          ${((inv.docType || 'sale') === 'sale' && due > 0) ? `<button class="btn btn-ghost btn-block mt-8" data-action="remind-invoice" data-id="${inv.id}">Send payment reminder (WhatsApp)</button>` : ''}
+          ${(inv.docType || 'sale') === 'sale' ? `<button class="btn btn-ghost btn-block mt-8" data-action="return-from-invoice" data-id="${inv.id}">Return items from this invoice</button>` : ''}
         </div>
       </div>`;
   }
@@ -1506,12 +2345,14 @@
     const W = 210, m = 16;
     const paid = inv.paidAmount || 0;
     const due = Math.max(0, (inv.total || 0) - paid);
-    const statusText = due <= 0 ? 'PAID' : (paid > 0 ? 'PARTIAL' : 'UNPAID');
+    const statusText = inv.docType === 'estimate' ? 'QUOTE' : (due <= 0 ? 'PAID' : (paid > 0 ? 'PARTIAL' : 'UNPAID'));
     let y = 0;
 
-    // Header band
-    doc.setFillColor(13, 148, 136);
-    doc.rect(0, 0, W, 36, 'F');
+    // Header (theme: filled band or clean line)
+    const TH = HisablyReceipt.themeOf(settings), A = HisablyReceipt.hexRgb(TH.accent), D = HisablyReceipt.hexRgb(TH.dark), S = HisablyReceipt.hexRgb(TH.soft);
+    const band = TH.style === 'band';
+    if (band) { doc.setFillColor(A[0], A[1], A[2]); doc.rect(0, 0, W, 36, 'F'); }
+    else { doc.setFillColor(A[0], A[1], A[2]); doc.rect(0, 34, W, 1.4, 'F'); }
 
     let textX = m;
     if (settings.logo) {
@@ -1522,7 +2363,7 @@
         textX = m + 26;
       } catch (e) {}
     }
-    doc.setTextColor(255, 255, 255);
+    if (band) doc.setTextColor(255, 255, 255); else doc.setTextColor(15, 23, 42);
     doc.setFont('helvetica', 'bold');
     doc.setFontSize(16);
     doc.text(settings.businessName || 'Business', textX, 16);
@@ -1534,7 +2375,7 @@
 
     doc.setFont('helvetica', 'bold');
     doc.setFontSize(10);
-    doc.text('INVOICE', W - m, 14, { align: 'right' });
+    doc.text(docWord(inv).toUpperCase(), W - m, 14, { align: 'right' });
     doc.setFont('helvetica', 'normal');
     doc.setFontSize(9);
     doc.text(String(inv.number), W - m, 20, { align: 'right' });
@@ -1617,10 +2458,19 @@
     doc.setFont('helvetica', 'normal');
     doc.setFontSize(9);
     doc.setTextColor(100);
+    const ex = invExtraRows(inv);
     doc.text('Subtotal', tx, y);
     doc.setTextColor(15, 23, 42);
-    doc.text(`${settings.currency} ${money(inv.total)}`, W - m, y, { align: 'right' });
+    doc.text(`${settings.currency} ${money(ex.rows.length ? ex.sub : inv.total)}`, W - m, y, { align: 'right' });
     y += 6;
+    ex.rows.forEach(r => {
+      doc.setTextColor(100);
+      doc.text(r.label, tx, y);
+      doc.setTextColor(15, 23, 42);
+      doc.text(`${r.amt < 0 ? '-' : ''}${settings.currency} ${money(Math.abs(r.amt))}`, W - m, y, { align: 'right' });
+      y += 6;
+    });
+    if (inv.docType !== 'estimate') {
     doc.setTextColor(100);
     doc.text('Paid', tx, y);
     doc.setTextColor(16, 185, 129);
@@ -1636,10 +2486,11 @@
       doc.text(`${settings.currency} ${money(due)}`, W - m, y, { align: 'right' });
       y += 6;
     }
+    }
     y += 2;
-    doc.setFillColor(204, 251, 241);
+    doc.setFillColor(S[0], S[1], S[2]);
     doc.roundedRect(tx - 4, y - 4, W - m - (tx - 4), 10, 2, 2, 'F');
-    doc.setTextColor(15, 118, 110);
+    doc.setTextColor(D[0], D[1], D[2]);
     doc.setFont('helvetica', 'bold');
     doc.setFontSize(11);
     doc.text('Total', tx, y + 3);
@@ -1675,7 +2526,7 @@
     }
     doc.setFont('helvetica', 'bold');
     doc.setFontSize(9);
-    doc.setTextColor(13, 148, 136);
+    doc.setTextColor(A[0], A[1], A[2]);
     doc.text('Thank you for your business!', m, y);
     y += 5;
     doc.setFont('helvetica', 'normal');
@@ -1700,20 +2551,21 @@
   async function shareInvoiceImage(inv) {
     const paid = inv.paidAmount || 0;
     const due = Math.max(0, (inv.total || 0) - paid);
-    const statusText = due <= 0 ? 'PAID' : (paid > 0 ? 'PARTIAL' : 'UNPAID');
+    const statusText = inv.docType === 'estimate' ? 'QUOTE' : (due <= 0 ? 'PAID' : (paid > 0 ? 'PARTIAL' : 'UNPAID'));
     const statusColor = due <= 0 ? '#10B981' : (paid > 0 ? '#F59E0B' : '#EF4444');
 
+    const TH = HisablyReceipt.themeOf(settings), bandT = TH.style === 'band';
     const card = document.createElement('div');
     card.style.cssText = 'position:fixed;left:-9999px;top:0;width:400px;background:#fff;font-family:Inter,system-ui,sans-serif;color:#0F172A;border-radius:16px;overflow:hidden;';
     card.innerHTML = `
-      <div style="background:linear-gradient(135deg,#0D9488,#0F766E);color:#fff;padding:18px 20px;display:flex;align-items:center;gap:12px;">
-        ${settings.logo ? `<div style="width:46px;height:46px;border-radius:12px;background:#fff;display:flex;align-items:center;justify-content:center;overflow:hidden;flex-shrink:0"><img src="${settings.logo}" style="width:42px;height:42px;object-fit:contain"/></div>` : `<div style="width:46px;height:46px;border-radius:12px;background:#fff;color:#0D9488;font-weight:800;font-size:16px;display:flex;align-items:center;justify-content:center;flex-shrink:0">H</div>`}
+      <div style="${bandT ? `background:linear-gradient(135deg,${TH.accent},${TH.dark});color:#fff;` : `background:#fff;color:#0F172A;border-bottom:3px solid ${TH.accent};`}padding:18px 20px;display:flex;align-items:center;gap:12px;">
+        ${settings.logo ? `<div style="width:46px;height:46px;border-radius:12px;background:#fff;display:flex;align-items:center;justify-content:center;overflow:hidden;flex-shrink:0"><img src="${settings.logo}" style="width:42px;height:42px;object-fit:contain"/></div>` : `<div style="width:46px;height:46px;border-radius:12px;background:${bandT ? '#fff' : TH.soft};color:${TH.accent};font-weight:800;font-size:16px;display:flex;align-items:center;justify-content:center;flex-shrink:0">H</div>`}
         <div style="flex:1;min-width:0">
           <div style="font-size:17px;font-weight:700">${escapeHtml(settings.businessName)}</div>
           <div style="font-size:11px;opacity:0.9;margin-top:2px">${escapeHtml([settings.phone, settings.city].filter(Boolean).join(' · '))}</div>
         </div>
         <div style="text-align:right">
-          <div style="font-size:10px;font-weight:700;opacity:0.85;letter-spacing:0.05em">INVOICE</div>
+          <div style="font-size:10px;font-weight:700;opacity:0.85;letter-spacing:0.05em">${docWord(inv).toUpperCase()}</div>
           <div style="font-size:13px;font-weight:600">${escapeHtml(inv.number)}</div>
           <div style="font-size:10px;opacity:0.85">${formatDate(inv.date)}</div>
         </div>
@@ -1740,15 +2592,16 @@
         </div>
       </div>
       <div style="padding:4px 20px 8px">
-        <div style="display:flex;justify-content:space-between;font-size:13px;margin-bottom:4px">
+        ${(() => { const x = invExtraRows(inv); return x.rows.length ? [{ label: 'Subtotal', amt: x.sub }].concat(x.rows).map(r => `<div style="display:flex;justify-content:space-between;font-size:13px;margin-bottom:4px"><span style="color:#64748B">${escapeHtml(r.label)}</span><span style="font-weight:600">${r.amt < 0 ? '−' : ''}${settings.currency} ${money(Math.abs(r.amt))}</span></div>`).join('') : ''; })()}
+        ${inv.docType === 'estimate' ? '' : `        <div style="display:flex;justify-content:space-between;font-size:13px;margin-bottom:4px">
           <span style="color:#64748B">Paid</span><span style="color:#10B981;font-weight:600">${settings.currency} ${money(paid)}</span>
         </div>
         ${due > 0 ? `<div style="display:flex;justify-content:space-between;font-size:13px;margin-bottom:6px">
           <span style="color:#64748B">Due</span><span style="color:#EF4444;font-weight:600">${settings.currency} ${money(due)}</span>
-        </div>` : ''}
-        <div style="display:flex;justify-content:space-between;align-items:center;background:linear-gradient(135deg,#CCFBF1,#F0FDFA);border-radius:12px;padding:12px 14px;margin-top:4px">
+        </div>` : ''}`}
+        <div style="display:flex;justify-content:space-between;align-items:center;background:linear-gradient(135deg,${TH.soft},${TH.softer});border-radius:12px;padding:12px 14px;margin-top:4px">
           <span style="font-weight:700;font-size:14px">Total</span>
-          <span style="font-weight:800;font-size:18px;color:#0F766E">${settings.currency} ${money(inv.total)}</span>
+          <span style="font-weight:800;font-size:18px;color:${TH.dark}">${settings.currency} ${money(inv.total)}</span>
         </div>
       </div>
       ${(settings.paymentQr && (!window.HisablyFreemium || HisablyFreemium.effectivePlan().limits.paymentQrOnInvoice)) ? `
@@ -1771,7 +2624,7 @@
         const file = new File([blob], `Invoice-${inv.number}.png`, { type: 'image/png' });
         if (navigator.share && navigator.canShare && navigator.canShare({ files: [file] })) {
           try {
-            await navigator.share({ files: [file], title: `Invoice ${inv.number}`, text: `Invoice from ${settings.businessName}` });
+            await navigator.share({ files: [file], title: `${docWord(inv)} ${inv.number}`, text: `${docWord(inv)} from ${settings.businessName}` });
             toast('Shared');
             return;
           } catch (err) {
@@ -1794,14 +2647,18 @@
   }
 
   function shareWhatsAppText(inv) {
-    let text = `*${settings.businessName}*\nInvoice ${inv.number}\nDate: ${formatDate(inv.date)}\nCustomer: ${inv.customerName || 'Walk-in'}\n\n`;
+    let text = `*${settings.businessName}*\n${docWord(inv)} ${inv.number}\nDate: ${formatDate(inv.date)}\nCustomer: ${inv.customerName || 'Walk-in'}\n\n`;
     inv.items.forEach(it => {
       text += `• ${it.name} × ${it.qty} = ${settings.currency} ${money(it.price * it.qty)}\n`;
     });
+    const wx = invExtraRows(inv);
+    if (wx.rows.length) {
+      text += `\nSubtotal: ${settings.currency} ${money(wx.sub)}`;
+      wx.rows.forEach(r => { text += `\n${r.label}: ${r.amt < 0 ? '-' : ''}${settings.currency} ${money(Math.abs(r.amt))}`; });
+    }
     text += `\n*Total: ${settings.currency} ${money(inv.total)}*`;
     if (settings.phone) text += `\n\nContact: ${settings.phone}`;
-    const phone = (inv.customerPhone || '').replace(/\D/g, '');
-    window.open(`https://wa.me/${phone}?text=${encodeURIComponent(text)}`, '_blank');
+    sendWhatsApp(inv.customerPhone, text);
   }
 
   // ---------- Receipt printing: 58 / 80 / 88 mm thermal, A4, Bluetooth ----------
@@ -2391,6 +3248,7 @@
     const action = t.dataset.action;
     const view = t.dataset.view || (t.classList.contains('nav-item') ? t.dataset.view : null);
     const id = t.dataset.id;
+    if (isStaff() && action && STAFF_BLOCK.test(action)) { toast('Only the owner can do that'); return; }
 
     if (view) {
       setView(view);
@@ -2398,6 +3256,19 @@
     }
 
     switch (action) {
+      case 'pick-theme': {
+        const k = t.dataset.theme;
+        if (HisablyReceipt.THEMES[k] && HisablyReceipt.THEMES[k].pro && !HisablyFreemium.hasFeature('themes')) { toast('This style is a Pro feature.', 4000); openPlansModal && openPlansModal(); break; }
+        settings.invoiceTheme = k; persist();
+        const box = document.getElementById('themePicker'); if (box) box.outerHTML = themePickerHTML();
+        break;
+      }
+      case 'lock-now': showLock(); break;
+      case 'pin-set-owner': openPinModal('owner'); break;
+      case 'pin-set-staff': openPinModal('staff'); break;
+      case 'pin-remove':
+        if (confirm('Remove the PIN lock and staff PIN?')) { settings.pinHash = ''; settings.staffHash = ''; persist(); setRole(''); toast('Lock removed'); openSettingsModal(); }
+        break;
       case 'add-product': openProductModal(); break;
       case 'filter-cat': productCat = t.dataset.cat || ''; render(); break;
       case 'bulk-tools': openBulkModal(); break;
@@ -2473,6 +3344,42 @@
           setView('suppliers');
         }
         break;
+      case 'inv-filter': invFilter = t.dataset.kind || 'all'; render(); break;
+      case 'receive-payment': { const c = customers.find(x => x.id === id); if (c) openReceiveModal(c); break; }
+      case 'open-statement': { const c = customers.find(x => x.id === id); if (c) openStatement(c); break; }
+      case 'statement-pdf': { const c = customers.find(x => x.id === id); if (c) statementPDF(c); break; }
+      case 'statement-wa': { const c = customers.find(x => x.id === id); if (c) sendWhatsApp(c.phone, statementText(c)); break; }
+      case 'remind-customer': { const c = customers.find(x => x.id === id); if (c) sendWhatsApp(c.phone, reminderText(c)); break; }
+      case 'remind-invoice': { const inv = invoices.find(x => x.id === id); if (inv) { const c = custOfInvoice(inv); sendWhatsApp(c.phone, reminderText(c, inv)); } break; }
+      case 'db-range': dbRange = t.dataset.v; render(); break;
+      case 'db-mode': dbMode = t.dataset.v; render(); break;
+      case 'rp-mode': { const row = t.parentElement; row.querySelectorAll('.cat-chip').forEach(x => x.classList.toggle('active', x === t)); break; }
+      case 'new-purchase': docCtx = { type: 'purchase' }; closeModal(); setView('create-invoice'); break;
+      case 'view-purchase': { const p = purchases.find(x => x.id === id); if (p) openPurchaseDetail(p); break; }
+      case 'purchase-pay': {
+        const p = purchases.find(x => x.id === id); if (!p) break;
+        const amt = parseFloat($('#recordPayInput') && $('#recordPayInput').value) || 0;
+        if (amt <= 0) { toast('Enter a valid amount'); break; }
+        addPayment(p, amt, pickedMode('rpMode'), ''); persist(); toast('Payment recorded'); openPurchaseDetail(p); if (currentView === 'purchases') render(); break;
+      }
+      case 'purchase-pay-full': {
+        const p = purchases.find(x => x.id === id); if (!p) break;
+        addPayment(p, (p.total || 0) - (p.paidAmount || 0), pickedMode('rpMode'), ''); persist(); toast('Marked as paid'); openPurchaseDetail(p); if (currentView === 'purchases') render(); break;
+      }
+      case 'view-supplier': { const sp = suppliers.find(x => x.id === id); if (sp) openSupplierDetail(sp); break; }
+      case 'pay-supplier': { const sp = suppliers.find(x => x.id === id); if (sp) openPaySupplierModal(sp); break; }
+      case 'new-estimate': docCtx = { type: 'estimate' }; closeModal(); setView('create-invoice'); break;
+      case 'convert-estimate': {
+        const q = invoices.find(x => x.id === id);
+        if (q) { docCtx = { type: 'sale', from: q }; closeModal(); setView('create-invoice'); }
+        break;
+      }
+      case 'new-return': docCtx = { type: 'return' }; closeModal(); setView('create-invoice'); break;
+      case 'return-from-invoice': {
+        const inv = invoices.find(x => x.id === id);
+        if (inv) { docCtx = { type: 'return', ref: inv }; closeModal(); setView('create-invoice'); }
+        break;
+      }
       case 'view-invoice': {
         const inv = invoices.find(x => x.id === id);
         if (inv) openInvoiceDetail(inv);
@@ -2564,13 +3471,7 @@
         const input = $('#recordPayInput');
         const amt = parseFloat(input && input.value) || 0;
         if (amt <= 0) { toast('Enter a valid amount'); break; }
-        inv.paidAmount = round2((inv.paidAmount || 0) + amt);
-        if (inv.paidAmount >= inv.total) {
-          inv.paidAmount = inv.total;
-          inv.paymentStatus = 'paid';
-        } else {
-          inv.paymentStatus = 'partial';
-        }
+        addPayment(inv, amt, pickedMode('rpMode'), '');
         persist();
         toast('Payment recorded');
         openInvoiceDetail(inv);
@@ -2579,6 +3480,7 @@
       case 'mark-paid': {
         const inv = invoices.find(x => x.id === id);
         if (!inv) break;
+        addPayment(inv, inv.total - (inv.paidAmount || 0), pickedMode('rpMode'), '');
         inv.paidAmount = inv.total;
         inv.paymentStatus = 'paid';
         persist();
@@ -2744,7 +3646,7 @@
         break;
       }
       case 'export-data': {
-        const data = { products, invoices, customers, suppliers, expenses, stockMovements, settings, invoiceCounter, exportedAt: new Date().toISOString() };
+        const data = { products, invoices, customers, suppliers, expenses, stockMovements, purchases, settings, invoiceCounter, exportedAt: new Date().toISOString() };
         const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
         const a = document.createElement('a');
         a.href = URL.createObjectURL(blob);
@@ -2772,6 +3674,7 @@
                 if (Array.isArray(data.suppliers)) suppliers = data.suppliers;
                 if (Array.isArray(data.expenses)) expenses = data.expenses;
                 if (Array.isArray(data.stockMovements)) stockMovements = data.stockMovements;
+                if (Array.isArray(data.purchases)) purchases = data.purchases;
                 if (data.settings) settings = Object.assign({}, settings, data.settings);
                 if (data.invoiceCounter) invoiceCounter = Math.max(invoiceCounter, Number(data.invoiceCounter) || 0);
                 normalizeData();
@@ -2792,7 +3695,7 @@
       }
       case 'clear-data':
         if (confirm('Delete ALL data? This also deletes it from your cloud account and cannot be undone.')) {
-          products = []; invoices = []; customers = []; suppliers = []; expenses = []; stockMovements = [];
+          products = []; invoices = []; customers = []; suppliers = []; expenses = []; stockMovements = []; purchases = [];
           invoiceCounter = 1001;
           persist();
           toast('All data cleared');
@@ -2940,7 +3843,7 @@
       // ---- merge (synchronous) ----
       const changes = { tombs: JSON.parse(JSON.stringify(tombs)) };
       SYNC_COLLECTIONS.forEach(n => {
-        const m = mergeCollection(n, remote[DB_TABLE[n] || n]);
+        const m = mergeCollection(n, remote[DB_TABLE[n] || n] || { live: [], tombs: {} });
         setList(n, m.list);
         changes[n] = m.push;
       });
@@ -3004,7 +3907,7 @@
   // Local data belongs to ONE account. If someone else signs in on this phone,
   // start clean so one shop's data can never be uploaded into another shop.
   function wipeLocalData() {
-    products = []; invoices = []; customers = []; suppliers = []; expenses = []; stockMovements = [];
+    products = []; invoices = []; customers = []; suppliers = []; expenses = []; stockMovements = []; purchases = [];
     settings = defaultSettings();
     invoiceCounter = 1001;
     tombs = {};
@@ -3523,6 +4426,7 @@
 
   function enterApp() {
     showAppShell();
+    if (lockEnabled() && !getRole()) showLock();
     migrateData();
     // Cloud mode gets payment details from the database; this same-browser shortcut is for local testing only
     try {
