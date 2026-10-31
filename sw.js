@@ -1,5 +1,5 @@
 /* Hisably service worker – offline app shell + cached libraries */
-const CACHE = 'hisably-v11';
+const CACHE = 'hisably-v20';
 
 const LOCAL_ASSETS = [
   './',
@@ -12,7 +12,10 @@ const LOCAL_ASSETS = [
   './js/supabase-config.js',
   './manifest.json',
   './assets/icon-192.png',
-  './assets/icon-512.png'
+  './assets/icon-512.png',
+  './assets/icon-maskable-512.png',
+  './assets/apple-touch-icon.png',
+  './assets/favicon-32.png'
 ];
 
 // Third-party libraries the app needs for PDF / image invoices / barcode scan / cloud.
